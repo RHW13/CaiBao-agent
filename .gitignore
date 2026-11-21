@@ -1,0 +1,9 @@
+.env
+data/*.pdf
+__pycache__/
+*.pyc
+.streamlit/secrets.toml
+.venv/
+.trae/
+.vscode/
+.pytest_cache/
