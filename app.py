@@ -1,6 +1,6 @@
-"""财报分析智能体 · Streamlit 主入口（Day 1-2）。
+"""财报分析智能体 · Streamlit 主入口。
 
-链路：上传年报 PDF → 解析三表 → 36 比率计算（口径可切换）→ 杜邦分析 → 自定义公式。
+链路：上传年报/半年报/季报 → 解析三表 → 36 比率 → 杜邦 → 风险 → 拐点 → 问答 → 投研底稿。
 """
 import os
 import tempfile
@@ -24,8 +24,15 @@ from core.forecast import forecast, dcf
 from core.qa import answer as qa_answer
 from core.draft import CHAPTERS, assemble, to_docx, to_markdown, to_pdf
 from core.config import get_llm_client
+import ui_theme as ui
 
-st.set_page_config(page_title="财报分析智能体", layout="wide")
+st.set_page_config(
+    page_title="财报分析智能体",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+ui.apply_theme()
 
 MAX_MB = 50
 
@@ -51,8 +58,7 @@ def parse_bytes(content: bytes) -> dict:
 
 
 # ---------------- 侧边栏 ----------------
-st.sidebar.title("财报分析智能体")
-st.sidebar.caption("Day 1-10 · 解析 / 比率 / 风险 / 拐点 / 问答 / 投研底稿")
+ui.sidebar_brand()
 
 uploaded = st.sidebar.file_uploader("上传年报 PDF", type=["pdf"])
 
@@ -80,7 +86,7 @@ dep_amort = st.sidebar.number_input("折旧摊销（元）", min_value=0.0, valu
                                     help="取自现金流量表补充资料，用于现金营运指数")
 
 if uploaded is None:
-    st.info("请在左侧上传年报 PDF 开始分析。")
+    ui.landing()
     st.stop()
 
 if uploaded.size > MAX_MB * 1024 * 1024:
@@ -108,7 +114,11 @@ extra = {
 caliber_map = {"速动比率": quick_ratio, "净资产收益率(ROE)": roe_caliber}
 
 meta = data.get("meta", {})
-st.title(f"{meta.get('company') or '公司'} · {meta.get('year') or ''} {meta.get('period') or '年度报告'}")
+ui.company_header(
+    meta.get("company") or "未识别公司",
+    meta.get("year") or "",
+    meta.get("period") or "年度报告",
+)
 
 SCENES = {
     "研究": ("全量分析", "从解析到结论全流程走一遍。",
