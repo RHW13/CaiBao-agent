@@ -109,6 +109,91 @@ tests/                 pytest 冒烟测试
 | 端口被占用 | 用 `--server.port 0` 自动选端口，或先关闭旧 Streamlit 进程 |
 | PDF 导出失败 | 确认已安装 `reportlab`；否则可只导出 Word |
 
+## 部署到云服务器（Docker，推荐）
+
+GitHub 访问不稳定时，用一台国内云服务器即可获得公网访问、免安装与 7×24 可用。
+仓库已提供 `Dockerfile`、`.dockerignore`、`docker-compose.yml`、`.streamlit/config.toml`。
+
+### 1. 准备服务器
+
+- 规格：2 核 2G 起（阿里云/腾讯云轻量应用服务器均可）
+- 系统：Ubuntu 22.04 / 24.04
+- 安全组放行 **8501** 端口（直接用 `IP:8501` 访问，无需 ICP 备案；绑定域名走 80/443 才需要备案）
+
+```bash
+# 安装 Docker
+curl -fsSL https://get.docker.com | sh
+systemctl enable --now docker
+docker --version
+```
+
+### 2. 上传代码
+
+任选一种：
+
+```powershell
+# Windows 本机，用 scp 上传（排除大文件）
+scp -r app.py core data requirements*.txt .streamlit Dockerfile .dockerignore docker-compose.yml .env.example root@<服务器IP>:/opt/caibao/
+```
+
+或先把仓库推到 Gitee，再在服务器上 `git clone`。
+
+### 3. 配置密钥并启动
+
+```bash
+cd /opt/caibao
+cp .env.example .env
+vi .env                      # 填入 DEEPSEEK_API_KEY
+docker compose up -d --build
+docker compose logs -f       # Ctrl+C 退出日志
+```
+
+浏览器打开 `http://<服务器IP>:8501`，上传一份年报验证解析、比率、问答与底稿导出。
+
+### 4. 日常运维
+
+```bash
+docker compose ps
+docker compose restart
+docker compose up -d --build   # 代码更新后重新构建
+docker compose down            # 停止
+```
+
+容器已配置 `restart: unless-stopped`，服务器重启后会自动拉起。
+
+### 5. 可选：域名 + 访问密码（强烈建议）
+
+财报工具不应裸奔在公网。用 Nginx 反代并加 Basic Auth：
+
+```nginx
+server {
+    listen 80;
+    server_name your.domain.com;
+    auth_basic "Restricted";
+    auth_basic_user_file /etc/nginx/.htpasswd;
+
+    location / {
+        proxy_pass http://127.0.0.1:8501;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_read_timeout 3600s;
+    }
+}
+```
+
+```bash
+apt install -y nginx apache2-utils
+printf "caibao:%s\n" "$(openssl passwd -apr1 '你的密码')" > /etc/nginx/.htpasswd
+# 把上面的 server 块写入 /etc/nginx/conf.d/caibao.conf 后：
+nginx -t && systemctl reload nginx
+```
+
+`proxy_set_header Upgrade/Connection` 是 Streamlit 的 WebSocket 必需项，缺少会导致页面一直转圈。
+
+---
+
 ## 部署指南（GitHub + Streamlit Community Cloud）
 
 ### 一、安装并配置 Git

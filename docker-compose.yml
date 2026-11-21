@@ -1,0 +1,12 @@
+services:
+  app:
+    build: .
+    image: caibao-agent:latest
+    container_name: caibao-agent
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    environment:
+      TZ: Asia/Shanghai
