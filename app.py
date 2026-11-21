@@ -25,6 +25,7 @@ from core.qa import answer as qa_answer
 from core.draft import CHAPTERS, assemble, to_docx, to_markdown, to_pdf
 from core.config import get_llm_client
 import ui_theme as ui
+import qa_widget_component as qa_widget
 
 st.set_page_config(
     page_title="财报分析智能体",
@@ -33,6 +34,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 ui.apply_theme()
+st.session_state.setdefault("chat", [])
 
 MAX_MB = 50
 
@@ -53,8 +55,13 @@ def parse_bytes(content: bytes) -> dict:
         tmp = f.name
     try:
         return load_pdf(tmp)
+    except Exception as exc:  # 损坏 / 加密 / 非标准 PDF
+        raise RuntimeError(f"无法解析该 PDF（{exc}）。请确认文件完整、未加密且为原始下载件。") from exc
     finally:
-        os.unlink(tmp)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
 
 
 # ---------------- 侧边栏 ----------------
@@ -87,6 +94,7 @@ dep_amort = st.sidebar.number_input("折旧摊销（元）", min_value=0.0, valu
 
 if uploaded is None:
     ui.landing()
+    qa_widget.mount(st.session_state.get("chat", []), ready=False)
     st.stop()
 
 if uploaded.size > MAX_MB * 1024 * 1024:
@@ -100,7 +108,7 @@ if st.session_state.get("draft_key") != file_key:
 try:
     with st.spinner("解析财报…"):
         data = parse_bytes(uploaded.getvalue())
-except ParseError as e:
+except (ParseError, RuntimeError) as e:
     st.error(str(e))
     st.stop()
 
@@ -119,6 +127,25 @@ ui.company_header(
     meta.get("year") or "",
     meta.get("period") or "年度报告",
 )
+
+qa_event = qa_widget.mount(
+    st.session_state.get("chat", []),
+    ready=True,
+    company=meta.get("company") or "",
+)
+if qa_event and qa_event.get("action") == "ask":
+    _nonce = str(qa_event.get("nonce") or "")
+    _question = (qa_event.get("question") or "").strip()
+    if _question and _nonce and _nonce != st.session_state.get("_qa_nonce"):
+        st.session_state["_qa_nonce"] = _nonce
+        _use_llm = st.session_state.get("qa_llm", get_llm_client() is not None)
+        _result = qa_answer(_question, data, index=index, use_llm=_use_llm)
+        st.session_state.chat.append({"role": "user", "content": _question})
+        st.session_state.chat.append({
+            "role": "assistant", "content": _result["answer"],
+            "citations": _result["citations"],
+        })
+        st.rerun()
 
 SCENES = {
     "研究": ("全量分析", "从解析到结论全流程走一遍。",

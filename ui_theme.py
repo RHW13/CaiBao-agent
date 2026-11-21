@@ -149,6 +149,22 @@ hr{ border-color:var(--line); }
 @media (prefers-reduced-motion:reduce){
   *{ transition:none !important; animation:none !important; }
 }
+
+/* ---------- 财报问答悬浮组件 ----------
+   组件内部的 main.js 会把 iframe 自身调成悬浮框（同源，可精确控制大小）；
+   这里保留一份 CSS 兜底，避免脚本被拦时组件铺满屏幕。 */
+iframe[title*="qa_widget"],
+[data-testid="stCustomComponentV1"] iframe{
+  position:fixed !important; right:12px !important; top:50% !important;
+  left:auto !important; bottom:auto !important;
+  width:100px !important; height:126px !important;
+  transform:translateY(-50%);
+  border:0 !important; background:transparent !important;
+  z-index:9000 !important;
+}
+[data-testid="stCustomComponentV1"], .stCustomComponentV1{
+  height:0 !important; min-height:0 !important; margin:0 !important; padding:0 !important;
+}
 </style>
 """
 

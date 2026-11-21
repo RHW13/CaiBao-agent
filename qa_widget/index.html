@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>财报问答</title>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <div id="root">
+    <!-- 常驻形象 -->
+    <button id="mascot" class="mascot" type="button" aria-label="打开财报问答" aria-expanded="false">
+      <span class="mascot-halo"></span>
+      <span class="mascot-art" id="mascot-art">
+        <svg viewBox="0 0 96 96" role="img" aria-hidden="true">
+          <defs>
+            <linearGradient id="owlBody" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0" stop-color="#1E4C86" />
+              <stop offset="1" stop-color="#12345E" />
+            </linearGradient>
+          </defs>
+          <!-- 耳羽 -->
+          <path d="M26 22 L31 40 L20 36 Z" fill="#12345E" />
+          <path d="M70 22 L65 40 L76 36 Z" fill="#12345E" />
+          <!-- 身体 -->
+          <ellipse cx="48" cy="56" rx="27" ry="30" fill="url(#owlBody)" />
+          <!-- 腹部 -->
+          <ellipse cx="48" cy="64" rx="16" ry="20" fill="#F4F8FF" opacity="0.95" />
+          <path d="M40 58 q8 6 16 0" stroke="#D7E4F5" stroke-width="2" fill="none" />
+          <path d="M39 66 q9 6 18 0" stroke="#D7E4F5" stroke-width="2" fill="none" />
+          <!-- 翅膀 -->
+          <ellipse cx="24" cy="60" rx="7" ry="15" fill="#1B4B86" />
+          <ellipse cx="72" cy="60" rx="7" ry="15" fill="#1B4B86" />
+          <!-- 眼睛 -->
+          <circle cx="38" cy="42" r="11" fill="#FFFFFF" />
+          <circle cx="58" cy="42" r="11" fill="#FFFFFF" />
+          <circle cx="39" cy="43" r="4.6" fill="#12345E" />
+          <circle cx="59" cy="43" r="4.6" fill="#12345E" />
+          <circle cx="40.6" cy="41.4" r="1.5" fill="#FFFFFF" />
+          <circle cx="60.6" cy="41.4" r="1.5" fill="#FFFFFF" />
+          <!-- 圆框眼镜 -->
+          <circle cx="38" cy="42" r="12" fill="none" stroke="#C0A062" stroke-width="1.8" />
+          <circle cx="58" cy="42" r="12" fill="none" stroke="#C0A062" stroke-width="1.8" />
+          <path d="M50 42 h-0" stroke="#C0A062" stroke-width="1.8" />
+          <path d="M26 40 l-5 -2" stroke="#C0A062" stroke-width="1.6" />
+          <path d="M70 40 l5 -2" stroke="#C0A062" stroke-width="1.6" />
+          <!-- 喙 -->
+          <path d="M48 50 l-4 6 h8 Z" fill="#C0A062" />
+          <!-- 账簿 -->
+          <g transform="translate(50 70) rotate(-8)">
+            <rect x="0" y="0" width="24" height="16" rx="2.5" fill="#FFFFFF" stroke="#D7E4F5" />
+            <path d="M12 1 v14" stroke="#C0A062" stroke-width="1.4" />
+            <path d="M4 5 h5 M4 9 h5 M15 5 h5 M15 9 h5" stroke="#B9CFE8" stroke-width="1.2" />
+          </g>
+          <!-- 爪 -->
+          <path d="M40 84 v4 M48 85 v4 M56 84 v4" stroke="#C0A062" stroke-width="2" stroke-linecap="round" />
+        </svg>
+      </span>
+      <span class="mascot-badge">财报问答</span>
+    </button>
+
+    <!-- 聊天窗 -->
+    <section id="panel" class="panel" aria-label="财报问答对话框" hidden>
+      <header id="drag-handle" class="panel-head">
+        <span class="panel-avatar" id="panel-avatar"></span>
+        <div class="panel-title">
+          <strong>财报问答</strong>
+          <small id="panel-company">数字题直接计算，文本题标注页码</small>
+        </div>
+        <div class="panel-actions">
+          <button id="btn-min" type="button" title="最小化" aria-label="最小化">—</button>
+          <button id="btn-close" type="button" title="关闭" aria-label="关闭">×</button>
+        </div>
+      </header>
+
+      <div id="messages" class="messages"></div>
+
+      <form id="composer" class="composer">
+        <textarea id="input" rows="1" placeholder="例如：营业收入是多少？净利润下降的原因？"
+                  aria-label="输入问题"></textarea>
+        <button id="send" type="submit" aria-label="发送">发送</button>
+      </form>
+      <div class="hint">Enter 发送 · Shift+Enter 换行 · 按住标题栏可拖动</div>
+    </section>
+  </div>
+  <script src="./main.js"></script>
+</body>
+</html>
