@@ -9,6 +9,7 @@ AST JSON 格式：
 
 nz(x)：科目缺失（None）时按 0 计，用于报表中空白的可选科目（如交易性金融资产）。
 abs(x)：取绝对值，用于利息支出等以负数列示的科目。
+validate_ast(x)：校验并规范化外部来源（LLM）的 AST JSON，白名单外的结构一律拒绝。
 """
 import ast
 
@@ -19,6 +20,11 @@ class FormulaError(Exception):
 
 _ALLOWED_OPS = {ast.Add: "+", ast.Sub: "-", ast.Mult: "*", ast.Div: "/"}
 _ALLOWED_FUNCS = {"sum", "avg", "yoy", "nz", "abs"}
+# 函数参数个数约束：sum/avg 至少 1 个，yoy/nz/abs 固定个数
+_FUNC_ARITY = {"sum": None, "avg": None, "yoy": 2, "nz": 1, "abs": 1}
+# 外部 AST（如 LLM 返回的 JSON）的嵌套深度与节点总数上限，防止深层递归与超大表达式
+_AST_MAX_DEPTH = 32
+_AST_MAX_NODES = 256
 
 
 def _node_to_json(node):
@@ -52,6 +58,60 @@ def parse_formula(text: str) -> dict:
     except SyntaxError:
         raise FormulaError("公式语法错误，请检查括号与运算符。")
     return _node_to_json(tree)
+
+
+def validate_ast(node, _depth: int = 0, _budget: list = None) -> dict:
+    """校验并规范化外部来源（如 LLM 返回）的 AST JSON。
+
+    parse_formula 由白名单语法树构造，天然可信；而模型输出属于外部数据，
+    可能包含非法键、非数值常量、未知函数或超深嵌套，直接交给 evaluate 会
+    得到错误结果或触发递归异常。此处按同一白名单重建 AST，任何不符即抛
+    FormulaError，调用方回退到规则通道或提示不可解析。
+    """
+    if _budget is None:
+        _budget = [_AST_MAX_NODES]
+    if _depth > _AST_MAX_DEPTH:
+        raise FormulaError("表达式嵌套过深，请简化公式。")
+    _budget[0] -= 1
+    if _budget[0] < 0:
+        raise FormulaError("表达式过长，请简化公式。")
+    if not isinstance(node, dict):
+        raise FormulaError("公式结构不合法。")
+
+    if "var" in node:
+        name = node["var"]
+        if not isinstance(name, str) or not name.strip():
+            raise FormulaError("变量名不合法。")
+        return {"var": name.strip()}
+    if "const" in node:
+        value = node["const"]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise FormulaError("常量必须是数字。")
+        return {"const": float(value)}
+    if "op" in node:
+        op = node["op"]
+        if not isinstance(op, str) or op not in _ALLOWED_OPS.values():
+            raise FormulaError("不支持的运算符（仅允许 + - * /）。")
+        return {
+            "op": op,
+            "left": validate_ast(node.get("left"), _depth + 1, _budget),
+            "right": validate_ast(node.get("right"), _depth + 1, _budget),
+        }
+    if "func" in node:
+        fn = node["func"]
+        if not isinstance(fn, str) or fn not in _ALLOWED_FUNCS:
+            raise FormulaError("不支持函数（仅允许 sum/avg/yoy/nz/abs）。")
+        args = node.get("args")
+        if not isinstance(args, list) or not args:
+            raise FormulaError("函数参数不合法。")
+        arity = _FUNC_ARITY.get(fn)
+        if arity is not None and len(args) != arity:
+            raise FormulaError(f"{fn} 需要 {arity} 个参数。")
+        return {
+            "func": fn,
+            "args": [validate_ast(a, _depth + 1, _budget) for a in args],
+        }
+    raise FormulaError("公式结构不合法。")
 
 
 def iter_vars(ast_node: dict, skip_nz: bool = False) -> list:

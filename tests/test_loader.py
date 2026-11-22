@@ -1,5 +1,7 @@
 """Day 1/9：PDF 解析与三表定位冒烟测试。"""
-from core.pdf_loader import _is_toc, detect_statement_pages
+import pytest
+
+from core.pdf_loader import ParseError, _is_toc, detect_statement_pages, extract_pages
 
 EXPECTED_688551 = {"balance_sheet": 104, "income": 108, "cashflow": 111}
 EXPECTED_159 = {"balance_sheet": 77, "income": 81, "cashflow": 85}
@@ -48,3 +50,11 @@ def test_three_statements_not_empty(pdf_data):
         assert len(pdf_data[key]) > 5
     assert pdf_data["meta"]["company"]
     assert pdf_data["meta"]["year"] == "2025"
+
+
+def test_non_pdf_content_rejected(tmp_path):
+    """扩展名为 .pdf 但内容无 %PDF- 文件头时，应在解析前被拒绝。"""
+    fake = tmp_path / "fake.pdf"
+    fake.write_bytes(b"<html><body>not a pdf</body></html>")
+    with pytest.raises(ParseError):
+        extract_pages(str(fake))

@@ -103,8 +103,8 @@ def _match_account(q: str, data: dict):
     return None
 
 
-def _answer_ratio(name: str, pdf_data: dict, index, question: str) -> dict:
-    ratios = compute_ratios(pdf_data)
+def _answer_ratio(name: str, pdf_data: dict, index, question: str, caliber="标准") -> dict:
+    ratios = compute_ratios(pdf_data, caliber=caliber)
     row = ratios[ratios["指标"] == name]
     if row.empty:
         return {"route": "ratio", "answer": f"未找到指标「{name}」。", "citations": []}
@@ -218,6 +218,14 @@ def _retrieve(question: str, pdf_data: dict, limit: int = 4) -> list:
     return [{"page": h["page"], "snippet": h["snippet"]} for h in hits[:limit]]
 
 
+def _num_tokens(text: str) -> set:
+    """抽取文本中的数字（去掉千分位与百分号），用于可核验性检查。"""
+    tokens = set()
+    for t in re.findall(r"\d[\d,]*(?:\.\d+)?", text):
+        tokens.add(t.replace(",", ""))
+    return tokens
+
+
 def _llm_answer(question: str, citations: list) -> str:
     client = config.get_llm_client()
     if client is None:
@@ -237,7 +245,15 @@ def _llm_answer(question: str, citations: list) -> str:
         return ""
     valid = {c["page"] for c in citations}
     cited = {int(p) for p in re.findall(r"第(\d+)页", answer)}
-    return answer if cited & valid else ""
+    if not (cited & valid):
+        return ""
+    # 数字回查：答案中出现的每个数字都必须能在引用原文中找到，否则视为不可核验
+    # （模型自行推算/编造），退回原文摘录，避免编造数字误导用户。
+    body = re.sub(r"第\s*\d+\s*页", " ", answer)
+    allowed = _num_tokens(" ".join(c["snippet"] for c in citations))
+    if _num_tokens(body) - allowed:
+        return ""
+    return answer
 
 
 def _extractive(citations: list) -> str:
@@ -324,7 +340,7 @@ def _refuse(question: str) -> dict:
             "citations": []}
 
 
-def answer(question: str, pdf_data: dict, index=None, use_llm: bool = True) -> dict:
+def answer(question: str, pdf_data: dict, index=None, use_llm: bool = True, caliber="标准") -> dict:
     """问答主入口：数字题确定性计算，文本题检索 + 可选 LLM，无引用则拒答。"""
     question = (question or "").strip()
     if not question:
@@ -334,7 +350,7 @@ def answer(question: str, pdf_data: dict, index=None, use_llm: bool = True) -> d
     if _is_numeric(question):
         ratio = _match_ratio(question)
         if ratio:
-            return _answer_ratio(ratio, pdf_data, index, question)
+            return _answer_ratio(ratio, pdf_data, index, question, caliber=caliber)
         account = _match_account(question, build_data(pdf_data))
         if account:
             return _answer_account(account, question, pdf_data, index)

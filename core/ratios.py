@@ -6,6 +6,9 @@
   - _平均     -> (本期 + 上期) / 2
   - nz(...)  -> 科目缺失（报表空白项）时按 0 计
 
+「科目存在但金额空白」（如某公司无非流动负债，报表该行两个金额格均空白）由
+build_data 按 0 补入，与「科目缺失」区分：前者参与计算，后者标注数据缺失。
+
 字段说明：
   importance -> 核心 / 常用 / 了解（手册重要性标注）
   pct        -> 结果按百分比展示（计算值 × 100）
@@ -118,10 +121,11 @@ def _is_none(v) -> bool:
     return v is None or (isinstance(v, float) and pd.isna(v))
 
 
-def build_data(statements: dict, extra: dict = None) -> dict:
+def build_data(statements: dict, extra: dict = None, approx: set = None) -> dict:
     """把三表整理为 {科目键: 数值}，含 _上期 / _平均 后缀键。
 
     extra：外部补充数据（如每股市价、每股股利、折旧摊销），直接并入。
+    approx：可选，传入 set 时收集「单期近似」的 _平均 键（上期/本期缺一侧，按单期兜底）。
     """
     data = {}
     specs = [
@@ -144,13 +148,60 @@ def build_data(statements: dict, extra: dict = None) -> dict:
                     data[key + "_平均"] = (float(cur) + float(prev)) / 2.0
                 elif not _is_none(cur):
                     data[key + "_平均"] = float(cur)
+                    if approx is not None:
+                        approx.add(key + "_平均")
                 elif not _is_none(prev):
                     data[key + "_平均"] = float(prev)
+                    if approx is not None:
+                        approx.add(key + "_平均")
     if extra:
         for k, v in extra.items():
             if v is not None:
                 data[k] = float(v)
+    _apply_blank_accounts(statements, data)
+    _normalize_signs(data)
     return data
+
+
+_NEG_COST_KEYS = ("营业成本",)
+
+
+def _normalize_signs(data: dict) -> None:
+    """把以负数列示的成本类科目转为正数。
+
+    部分报表把营业成本作为收入抵减项写成负数（如「(194,366,771)」），
+    而比率公式按正数成本计算，若不统一会导致毛利率等指标失真。
+    """
+    for key in _NEG_COST_KEYS:
+        for suffix in ("", "_上期", "_平均"):
+            k = key + suffix
+            v = data.get(k)
+            if v is not None and v < 0:
+                data[k] = -v
+
+
+def _apply_blank_accounts(statements: dict, data: dict) -> None:
+    """把「科目存在、金额空白」的标准科目按 0 补入 data。
+
+    中国财报中空白单元格即无余额（0），而非「未披露」。解析层已把这类科目收集在
+    blank_accounts 中且不写入报表行，此处仅在该科目没有其它非空取值时补 0，
+    既不改变报表原样展示，也让依赖该科目的比率可正常计算（如非流动负债合计为空
+    时长期资本负债率应为 0%）。
+    """
+    blanks = (statements or {}).get("blank_accounts")
+    if not isinstance(blanks, dict):
+        return
+    for names in blanks.values():
+        if not isinstance(names, (list, tuple, set)):
+            continue
+        for name in names:
+            if not name or not isinstance(name, str) or data.get(name) is not None:
+                continue
+            data[name] = 0.0
+            if data.get(name + "_上期") is None:
+                data[name + "_上期"] = 0.0
+            if data.get(name + "_平均") is None:
+                data[name + "_平均"] = 0.0
 
 
 def _missing_vars(formula: str, data: dict) -> list:
@@ -183,7 +234,8 @@ def compute_ratios(statements: dict, caliber="标准", extra: dict = None) -> pd
     caliber：全局口径字符串，或 {指标名: 口径名} 的逐指标口径映射。
     extra：外部补充数据（每股市价、每股股利、折旧摊销等）。
     """
-    data = build_data(statements, extra)
+    approx = set()
+    data = build_data(statements, extra, approx=approx)
     rows = []
     for ind in INDICATORS:
         formula, cal_label = _spec_formula(ind, caliber)
@@ -205,6 +257,12 @@ def compute_ratios(statements: dict, caliber="标准", extra: dict = None) -> pd
             if value is None and not note:
                 missing = _missing_vars(formula, data)
                 note = ("数据缺失：" + "、".join(missing)) if missing else "分母为 0 或无法计算"
+        if value is not None and not note:
+            ast_node = parse_formula(formula)
+            used_approx = [v for v in dict.fromkeys(iter_vars(ast_node, skip_nz=False))
+                           if v in approx]
+            if used_approx:
+                note = "单期近似：" + "、".join(used_approx)
         if value is not None:
             value = value * scale
 

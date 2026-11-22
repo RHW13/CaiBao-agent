@@ -4,6 +4,7 @@
 置信度低于 0.7 标记「需人工确认」。
 """
 import difflib
+from collections import OrderedDict
 
 from .calibers import get_caliber
 from .evaluator import parse_formula, FormulaError, iter_vars
@@ -16,8 +17,9 @@ _FUZZY_MIN = 0.6
 # 年报三表内不存在、需用户外部输入的字段
 EXTERNAL_INPUTS = {"每股市价", "每股股利", "折旧摊销"}
 
-# LLM 匹配结果缓存：{(科目, 候选首行文本): (index, reason)}
-_LLM_CACHE = {}
+# LLM 匹配结果缓存：{(科目, 候选首行文本): (index, reason)}，按 LRU 淘汰
+_LLM_CACHE_MAX = 256
+_LLM_CACHE = OrderedDict()
 
 _NO_MATCH = {
     "found": False,
@@ -86,6 +88,14 @@ def _similarity(a: str, b: str) -> float:
     return difflib.SequenceMatcher(None, clean_account(a), clean_account(b)).ratio()
 
 
+def _cache_put(key, value) -> None:
+    """写入 LLM 匹配缓存；超出上限时淘汰最久未用项，避免长跑进程内存无界增长。"""
+    _LLM_CACHE[key] = value
+    _LLM_CACHE.move_to_end(key)
+    while len(_LLM_CACHE) > _LLM_CACHE_MAX:
+        _LLM_CACHE.popitem(last=False)
+
+
 def _llm_pick(account: str, candidates: list):
     """让 LLM 在候选行中挑选最匹配的科目行，返回 (候选下标, 理由) 或 None。"""
     from . import config
@@ -94,8 +104,10 @@ def _llm_pick(account: str, candidates: list):
     if client is None or not candidates:
         return None
     key = (account, candidates[0]["text"])
-    if key in _LLM_CACHE:
-        return _LLM_CACHE[key]
+    cached = _LLM_CACHE.get(key)
+    if cached is not None:
+        _LLM_CACHE.move_to_end(key)
+        return cached
 
     listing = "\n".join(
         f"{i}. 第{c['page']}页：{c['text']}" for i, c in enumerate(candidates)
@@ -121,7 +133,7 @@ def _llm_pick(account: str, candidates: list):
         idx = int(data.get("index", -1))
         reason = str(data.get("reason", "")).strip()
         result = (idx, reason)
-        _LLM_CACHE[key] = result
+        _cache_put(key, result)
         return result
     except Exception:
         return None

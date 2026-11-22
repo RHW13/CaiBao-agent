@@ -1,8 +1,13 @@
 [server]
 headless = true
-address = "0.0.0.0"
+# 默认仅本机可访问，避免未认证的分析服务暴露到局域网；
+# Docker 部署由 Dockerfile 的 --server.address=0.0.0.0 覆盖（容器内需监听全部网卡）。
+address = "127.0.0.1"
 port = 8501
 maxUploadSize = 50
+# 开发期保存文件后自动重跑主脚本，避免浏览器一直停留在旧界面；
+# 注意：修改被 import 的模块（core/*.py、ui_theme.py）仍需重启进程才会重新加载。
+runOnSave = true
 
 [browser]
 gatherUsageStats = false

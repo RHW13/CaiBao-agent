@@ -6,6 +6,7 @@
 """
 import json
 import re
+from collections import OrderedDict
 
 from . import config
 from .notes_scan import build_notes
@@ -36,7 +37,17 @@ _RELATED_RISK_KWS = ["资金占用", "对外担保", "拆借", "非经营性"]
 # 关联交易章节的强特征（排除公司治理章节的泛泛提及）
 _RELATED_STRONG_KWS = ["关联方关系", "关联交易类型", "关联交易情况", "关联方名称", "交易金额"]
 
-_CACHE = {}
+# LLM 抽取缓存：{(信号类型, 原文片段): [条目]}，按 LRU 淘汰，避免长期运行内存无界增长
+_CACHE_MAX = 64
+_CACHE = OrderedDict()
+
+
+def _cache_put(key, value) -> None:
+    """写入 LLM 抽取缓存；超出上限时淘汰最久未用项。"""
+    _CACHE[key] = value
+    _CACHE.move_to_end(key)
+    while len(_CACHE) > _CACHE_MAX:
+        _CACHE.popitem(last=False)
 
 
 def _sig(type_, level, basis, page=None, quote="", source="规则"):
@@ -139,7 +150,7 @@ def _pledge_signal(notes):
     for h in notes.search(_PLEDGE_KWS, limit=3):
         if "质押给本公司" in h["snippet"] or "质押给公司" in h["snippet"]:
             continue  # 债务人向本公司质押，属于增信而非本公司股东质押
-        keyword = next(k for k in _PLEDGE_KWS if k in h["snippet"])
+        keyword = next((k for k in _PLEDGE_KWS if k in h["snippet"]), _PLEDGE_KWS[0])
         if _not_applicable(h["snippet"], keyword):
             continue
         return _sig("股权质押", "关注", "存在股权质押相关披露，需核对质押比例与平仓风险",
@@ -174,6 +185,7 @@ def llm_signals(notes, per_type: int = 2):
         block = "\n".join(f"[第{h['page']}页] {h['snippet']}" for h in hits)
         key = (type_, block)
         if key not in _CACHE:
+            value = []
             try:
                 resp = client.chat.completions.create(
                     model=config.get_llm_model(),
@@ -185,11 +197,19 @@ def llm_signals(notes, per_type: int = 2):
                 )
                 content = resp.choices[0].message.content or ""
                 start, end = content.find("["), content.rfind("]")
-                _CACHE[key] = json.loads(content[start:end + 1]) if start >= 0 else []
+                if start >= 0:
+                    parsed = json.loads(content[start:end + 1])
+                    if isinstance(parsed, list):
+                        value = parsed
             except Exception:
-                _CACHE[key] = []
+                value = []
+            _cache_put(key, value)
+        else:
+            _CACHE.move_to_end(key)
 
         for item in _CACHE[key]:
+            if not isinstance(item, dict):
+                continue  # 模型输出元素类型不符时跳过，避免结构异常中断扫描
             quote = str(item.get("原文", "")).strip()
             try:
                 page = int(item.get("页码"))

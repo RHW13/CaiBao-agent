@@ -5,7 +5,9 @@ services:
     container_name: caibao-agent
     restart: unless-stopped
     ports:
-      - "8501:8501"
+      # 默认只绑定回环地址，经 Nginx 反代 + Basic Auth 对外（见 README）。
+      # 确需直连局域网时：APP_BIND=0.0.0.0 docker compose up -d
+      - "${APP_BIND:-127.0.0.1}:8501:8501"
     env_file:
       - .env
     environment:

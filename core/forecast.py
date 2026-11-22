@@ -26,6 +26,8 @@ def forecast(pdf_data: dict, revenue_growth: float = None,
         rev, data.get("营业收入_上期"))
     profit_g = profit_growth if profit_growth is not None else _growth(
         profit, data.get("净利润_上期"))
+    rev_missing = rev_g is None
+    profit_missing = profit_g is None
     rev_g = 0.0 if rev_g is None else rev_g
     profit_g = 0.0 if profit_g is None else profit_g
     cash_g = rev_g  # 经营现金流按营业收入增速外推，与 DCF 假设保持一致
@@ -42,6 +44,8 @@ def forecast(pdf_data: dict, revenue_growth: float = None,
         "revenue_growth": rev_g,
         "profit_growth": profit_g,
         "cash_growth": cash_g,
+        "revenue_growth_missing": rev_missing,
+        "profit_growth_missing": profit_missing,
     }
 
 
@@ -58,12 +62,15 @@ def dcf(pdf_data: dict, wacc: float = 0.10, terminal_growth: float = 0.03,
     if base is None:
         return {"ok": False, "reason": "缺少经营现金流与净利润，无法估值。"}
 
+    growth_missing = False
     growth = _growth(data.get("营业收入"), data.get("营业收入_上期"))
     if growth is None:
         growth = _growth(cash, data.get("经营活动产生的现金流量净额_上期"))
     if growth is None:
         growth = _growth(profit, data.get("净利润_上期"))
-    growth = 0.0 if growth is None else growth
+    if growth is None:
+        growth_missing = True
+        growth = 0.0
     growth = max(-0.30, min(0.30, growth + growth_adjust))
 
     flows = [base * (1 + growth) ** t for t in range(1, years + 1)]
@@ -78,11 +85,19 @@ def dcf(pdf_data: dict, wacc: float = 0.10, terminal_growth: float = 0.03,
     shares = data.get("股本")
     per_share = equity / shares if shares else None
 
+    warnings = []
+    if base < 0:
+        warnings.append("基期经营现金流为负，DCF 结果参考意义有限。")
+    if growth_missing:
+        warnings.append("同比增速均缺失，按 0 增长估值。")
+    if equity is not None and equity < 0:
+        warnings.append("股权价值为负，当前现金流/资本结构不支持 DCF 估值。")
     return {
         "ok": True, "growth": growth, "base_fcf": base,
         "flows": flows, "pv_stage1": pv_stage1,
         "terminal_value": terminal, "pv_terminal": pv_terminal,
         "enterprise": enterprise, "net_debt": debt - (data.get("货币资金") or 0.0),
         "equity": equity, "per_share": per_share,
-        "warning": "基期经营现金流为负，DCF 结果参考意义有限。" if base < 0 else "",
+        "growth_missing": growth_missing,
+        "warning": "".join(warnings),
     }

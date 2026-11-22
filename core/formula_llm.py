@@ -3,7 +3,7 @@ import json
 import re
 
 from . import config
-from .evaluator import parse_formula, FormulaError
+from .evaluator import parse_formula, validate_ast, FormulaError
 
 _SYS_PROMPT = (
     "你是财报指标公式解析器。把用户描述转化为 JSON AST，只能使用如下结构：\n"
@@ -62,7 +62,9 @@ def _llm_ast(client, text: str):
         json_str = _extract_json(content)
         if not json_str:
             return None
-        return json.loads(json_str)
+        # 模型输出属于外部数据：先按白名单校验重建 AST，非法结构直接放弃，
+        # 由 nl_to_ast 回退到规则通道，避免异常结构进入求值器。
+        return validate_ast(json.loads(json_str))
     except Exception:
         return None
 

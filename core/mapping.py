@@ -202,6 +202,8 @@ DEFAULT_ALIASES = {
     "汇率变动对现金及现金等价物的影响（汇兑损益）": "汇率变动对现金及现金等价物的影响",
     "现金及现金等价物净增加额（减少以-号填列）": "现金及现金等价物净增加额",
     "现金及现金等价物净增加额（减少以－号填列）": "现金及现金等价物净增加额",
+    "现金及现金等价物净增加(减少)额": "现金及现金等价物净增加额",
+    "现金及现金等价物净增加（减少）额": "现金及现金等价物净增加额",
     "年初现金及现金等价物余额": "期初现金及现金等价物余额",
     "期初现金及现金等价物余额（上年末）": "期初现金及现金等价物余额",
     "年末现金及现金等价物余额": "期末现金及现金等价物余额",
@@ -246,6 +248,23 @@ _NUM_PREFIX = re.compile(r"^\d+[.．、]")
 _FUNC_PREFIX = re.compile(r"^(?:其中|加|减)[：:]")
 # 行尾括号注释（全角/半角括号，如（损失以"-"号填列）、(元/股)）
 _TRAILING_PARA = re.compile(r"[（(][^（）()]*[）)]$")
+
+
+def _strip_disclosure(n: str) -> str:
+    """去掉行尾披露格式括号，如「净利润(净亏损以“()”号填列)」。
+
+    这类后缀内部可能嵌套括号，正则不好处理，直接回退到「最后一个左括号」处截断；
+    仅在结尾为括号且含「填列」时生效，避免误伤正常科目名。
+    """
+    if n.endswith((")", "）")) and "填列" in n:
+        for i, ch in enumerate(n):
+            if ch in "（(" and "填列" in n[i:]:
+                return n[:i]
+    return n
+# 行尾中文附注编号（如「营业成本四」中的「四」），仅在剥离后命中词典时才采用
+_NOTE_CN = re.compile(r"[一二三四五六七八九十]{1,2}$")
+# 行尾「不适用」标记（表格单元格文字被并入科目名时出现）
+_NA_TAIL = re.compile(r"(?:不适用)+$")
 # 行尾附注编号（如 七、1、十九、3、10）
 _NOTE_REF = re.compile(r"(?:[一二三四五六七八九十]+、)?\d+$")
 # 行尾零值占位符（如 投资性房地产七、20-；银行报表常见 – — ― 等长短破折号）
@@ -290,18 +309,40 @@ def clean_account(name: str) -> str:
 
 
 def normalize_account(name: str) -> str:
-    """将异名科目归一为规范科目键；未命中时原样返回（已清洗）。"""
+    """将异名科目归一为规范科目键；未命中时原样返回（已清洗）。
+
+    行尾可能叠加多个附注引用（如「…现金(五)46(1)」），需逐层剥离后再查词典。
+    """
     n = clean_account(name)
     if not n:
         return ""
     aliases = get_aliases()
-    if n in aliases:
-        return aliases[n]
-    # 去掉行尾括号注释（如“投资收益（损失以-号填列）”->“投资收益”）
-    m = _TRAILING_PARA.sub("", n)
-    if m and m != n:
-        return aliases.get(m, m)
-    return n
+    alias_values = set(aliases.values())
+    for _ in range(8):
+        if n in aliases:
+            return aliases[n]
+        m = _TRAILING_PARA.sub("", n)      # 去掉行尾括号注释（如「(1)」「(五)」）
+        if m == n:
+            m = _strip_disclosure(n)       # 去掉「(净亏损以…号填列)」类披露后缀
+        if m == n:
+            m = _NA_TAIL.sub("", n)        # 去掉行尾「不适用」标记
+        if m == n:
+            t = n.rstrip(")）")            # 去掉残留的右括号（如「…净额))」）
+            if t != n and (t in aliases or t in alias_values):
+                m = t
+        if m == n:
+            m = _NOTE_REF.sub("", n)       # 去掉括号后的残留附注编号（如「46」）
+        if m == n:
+            t = _NOTE_CN.sub("", n)        # 去掉行尾中文附注编号（如「营业成本四」）
+            if t != n:
+                t2 = _TRAILING_PARA.sub("", t)  # 编号后仍可能带单位括号（如「…(元/股)五」）
+                if (t in aliases or t in alias_values
+                        or t2 in aliases or t2 in alias_values):
+                    m = t
+        if m == n:
+            break
+        n = m
+    return aliases.get(n, n)
 
 
 def dump_default_aliases(path: str) -> None:

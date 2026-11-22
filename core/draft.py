@@ -408,3 +408,111 @@ def to_pdf(draft: dict, chapters: list = None) -> bytes:
                             title=f"{draft['公司概览']['公司']} 投研底稿")
     doc.build(story)
     return buf.getvalue()
+
+
+# ---------------- 导出：表格 PDF ----------------
+
+def _fmt_cell(v) -> str:
+    """按值类型格式化单元格，与界面数值格式保持一致。"""
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return "—"
+    if isinstance(v, bool):
+        return "是" if v else "否"
+    if isinstance(v, int):
+        return f"{v:,}"
+    if isinstance(v, float):
+        return f"{v:,.2f}" if abs(v) >= 1000 else f"{v:,.4f}"
+    return str(v)
+
+
+def _col_weights(df: pd.DataFrame) -> list:
+    """按列内容长度估算列宽权重，避免窄列浪费、宽列被挤压。"""
+    weights = []
+    for col in df.columns:
+        texts = [str(col)] + [str(_fmt_cell(v)) for v in df[col].head(80)]
+        weights.append(min(max(max(len(t) for t in texts), 4), 36))
+    total = float(sum(weights)) or 1.0
+    return [w / total for w in weights]
+
+
+def tables_to_pdf(tables: list, title: str = "表格导出", subtitle: str = "") -> bytes:
+    """把若干表格排版为一个 PDF，保留表头、网格、列结构与数值格式。
+
+    tables：[{"name": 表名, "frame": DataFrame}]。列数较多时自动使用横向 A4，
+    跨页重复表头，页脚标注文件名与页码。
+    """
+    if not tables:
+        raise ValueError("没有可导出的表格。")
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import A4, landscape
+        from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+        from reportlab.lib.units import cm
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+        from reportlab.platypus import (Paragraph, SimpleDocTemplate, Spacer,
+                                        Table, TableStyle)
+    except ImportError as exc:  # pragma: no cover - 依赖缺失时明确报错
+        raise RuntimeError("未安装 reportlab，无法导出 PDF。") from exc
+
+    font = "STSong-Light"
+    if font not in pdfmetrics.getRegisteredFontNames():
+        pdfmetrics.registerFont(UnicodeCIDFont(font))
+    base = getSampleStyleSheet()
+    body = ParagraphStyle("tbl-body", parent=base["Normal"], fontName=font,
+                          fontSize=8.5, leading=12)
+    h1 = ParagraphStyle("tbl-h1", parent=body, fontSize=15, leading=20, spaceAfter=4)
+    h2 = ParagraphStyle("tbl-h2", parent=body, fontSize=11, leading=15,
+                        spaceBefore=8, spaceAfter=4)
+    cell = ParagraphStyle("tbl-cell", parent=body, fontSize=7.5, leading=10)
+
+    max_cols = max(len(t["frame"].columns) for t in tables)
+    page = landscape(A4) if max_cols > 4 else A4
+    margin = 1.2 * cm
+    usable = page[0] - 2 * margin
+
+    def build_table(df: pd.DataFrame):
+        widths = [usable * w for w in _col_weights(df)]
+        data = [[Paragraph(escape(str(c)), cell) for c in df.columns]]
+        for _, row in df.iterrows():
+            data.append([Paragraph(escape(_fmt_cell(v)) or "&nbsp;", cell) for v in row])
+        table = Table(data, colWidths=widths, repeatRows=1, hAlign="LEFT")
+        style = [
+            ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#B9C2CC")),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#E8EDF2")),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 3),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+            ("TOPPADDING", (0, 0), (-1, -1), 2),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+        ]
+        for i in range(1, len(data)):
+            if i % 2 == 0:
+                style.append(("BACKGROUND", (0, i), (-1, i), colors.HexColor("#F7F9FB")))
+        table.setStyle(TableStyle(style))
+        return table
+
+    story = [Paragraph(escape(title), h1)]
+    if subtitle:
+        story.append(Paragraph(escape(subtitle), body))
+    story.append(Spacer(1, 6))
+    for t in tables:
+        df = t["frame"]
+        story.append(Paragraph(escape(f"{t['name']}（{len(df)} 行）"), h2))
+        story.append(build_table(df))
+        story.append(Spacer(1, 10))
+
+    buf = io.BytesIO()
+
+    def on_page(canvas, doc):
+        canvas.saveState()
+        canvas.setFont(font, 8)
+        canvas.setFillColor(colors.grey)
+        canvas.drawString(margin, 0.7 * cm, title)
+        canvas.drawRightString(page[0] - margin, 0.7 * cm, f"第 {doc.page} 页")
+        canvas.restoreState()
+
+    doc = SimpleDocTemplate(buf, pagesize=page, leftMargin=margin, rightMargin=margin,
+                            topMargin=1.2 * cm, bottomMargin=1.4 * cm, title=title)
+    doc.build(story, onFirstPage=on_page, onLaterPages=on_page)
+    return buf.getvalue()

@@ -9,6 +9,7 @@ import pandas as pd
 import streamlit as st
 
 from core.statements import load_pdf
+from core import history
 from core.pdf_loader import ParseError
 from core.pdf_index import build_index
 from core.evidence import indicator_evidence, attach_evidence
@@ -22,7 +23,7 @@ from core.benchmark import compare, bar_chart, score_matrix
 from core.attribution import dupont_attribution, gross_margin_breakdown, mdna_evidence
 from core.forecast import forecast, dcf
 from core.qa import answer as qa_answer
-from core.draft import CHAPTERS, assemble, to_docx, to_markdown, to_pdf
+from core.draft import CHAPTERS, assemble, to_docx, to_markdown, to_pdf, tables_to_pdf
 from core.config import get_llm_client
 import ui_theme as ui
 import qa_widget_component as qa_widget
@@ -37,6 +38,8 @@ ui.apply_theme()
 st.session_state.setdefault("chat", [])
 
 MAX_MB = 50
+# 单次横向对标最多纳入的文件数（含当前已上传公司），避免批量上传占满内存
+MAX_BENCH_FILES = 20
 
 
 def memo(key: str, factory):
@@ -47,6 +50,77 @@ def memo(key: str, factory):
     return store[key]
 
 
+def table_export_panel(prefix: str, page_name: str, tables: list, meta: dict) -> None:
+    """页面级表格导出：勾选表格 → 生成标准 PDF → 保存到本地。
+
+    tables：[{"name": 表名, "frame": DataFrame}]；prefix 为页面唯一键前缀。
+    勾选、全选/取消全选与下载按钮集中放在页面顶部，三页交互保持一致。
+    """
+    tables = [t for t in tables if t.get("frame") is not None and len(t["frame"])]
+    if not tables:
+        return
+    keys = [f"{prefix}_pick_{i}" for i in range(len(tables))]
+    # 默认全选：进入页面即可直接点下载，勾选框用于按需取消
+    for k in keys:
+        st.session_state.setdefault(k, True)
+    store = st.session_state.setdefault("_table_pdf", {})
+    picked = [t for i, t in enumerate(tables) if st.session_state.get(keys[i])]
+
+    st.markdown(f"### 表格下载 · {page_name}")
+    st.caption("勾选要导出的表格（默认全选），点击「仅下载选中表格」生成 PDF，"
+               "再点「保存 PDF 到本地」完成下载。")
+    with st.container(border=True):
+        head = st.columns([1, 1])
+        if head[0].button("全选", key=f"{prefix}_all", width="stretch"):
+            for k in keys:
+                st.session_state[k] = True
+            st.rerun()
+        if head[1].button("取消全选", key=f"{prefix}_none", width="stretch"):
+            for k in keys:
+                st.session_state[k] = False
+            st.rerun()
+
+        cols = st.columns(min(3, len(tables)))
+        for i, t in enumerate(tables):
+            cols[i % len(cols)].checkbox(t["name"], key=keys[i])
+        st.caption(f"已选 {len(picked)} / {len(tables)} 张表；未勾选的表格不会进入 PDF。")
+
+        # 独立的一级操作按钮：只导出当前勾选的表格
+        clicked = st.button(
+            f"仅下载选中表格（已选 {len(picked)} 张）", type="primary",
+            key=f"{prefix}_gen", width="stretch", disabled=not picked,
+        )
+
+        if clicked:
+            bar = st.progress(0.15, text="正在整理表格…")
+            try:
+                company = meta.get("company") or "公司"
+                period = f"{meta.get('year') or ''}{meta.get('period') or ''}"
+                pdf = tables_to_pdf(
+                    picked, title=f"{company} {page_name}",
+                    subtitle=f"报告期：{period}" if period else "",
+                )
+                bar.progress(1.0, text="生成完成")
+                store[prefix] = {
+                    "bytes": pdf,
+                    "name": f"{company}_{page_name}.pdf",
+                    "sig": "|".join(t["name"] for t in picked),
+                }
+            except Exception as exc:  # 依赖缺失、版面异常等
+                store.pop(prefix, None)
+                st.error(f"生成失败：{exc}。请调整勾选后重试。")
+
+        saved = store.get(prefix)
+        sig = "|".join(t["name"] for t in picked)
+        if saved and saved.get("sig") == sig:
+            st.success(f"PDF 已生成：{saved['name']}。点击下方按钮保存到本地。")
+            st.download_button(
+                "保存 PDF 到本地", saved["bytes"], file_name=saved["name"],
+                mime="application/pdf", key=f"{prefix}_save",
+                type="primary", width="stretch",
+            )
+
+
 @st.cache_data
 def parse_bytes(content: bytes) -> dict:
     """按文件内容缓存解析结果（避免切换页面/口径时重复解析 PDF）。"""
@@ -55,8 +129,12 @@ def parse_bytes(content: bytes) -> dict:
         tmp = f.name
     try:
         return load_pdf(tmp)
+    except ParseError:
+        raise
     except Exception as exc:  # 损坏 / 加密 / 非标准 PDF
-        raise RuntimeError(f"无法解析该 PDF（{exc}）。请确认文件完整、未加密且为原始下载件。") from exc
+        # 不向界面回显底层异常文本，避免泄露服务端临时路径与解析库内部细节；
+        # 具体原因保留在异常链中，供日志与本地排查使用。
+        raise RuntimeError("无法解析该 PDF。请确认文件完整、未加密且为原始下载件。") from exc
     finally:
         try:
             os.unlink(tmp)
@@ -64,10 +142,131 @@ def parse_bytes(content: bytes) -> dict:
             pass
 
 
+# ---------------- 上传历史 ----------------
+
+class _HistoryFile:
+    """把历史记录包装成与 UploadedFile 相同的最小接口。"""
+
+    def __init__(self, record: dict, blob: bytes):
+        self.name = record.get("name") or "历史文档.pdf"
+        self.size = record.get("size") or len(blob)
+        self._blob = blob
+
+    def getvalue(self) -> bytes:
+        return self._blob
+
+
+def _apply_delete(rid: str) -> None:
+    """删除单条记录并复位相关会话缓存（按钮回调）。"""
+    history.delete_record(rid)
+    if st.session_state.get("history_active") == rid:
+        st.session_state.pop("history_active", None)
+        st.session_state.pop("draft", None)
+        st.session_state.pop("draft_key", None)
+    st.session_state.pop("_table_pdf", None)
+    st.rerun()
+
+
+@st.dialog("删除上传记录")
+def confirm_delete(rid: str, name: str) -> None:
+    """二次确认弹窗：确认后同时删除索引与本地 PDF 文件。"""
+    st.write(f"确定删除「{name}」吗？该文档的本地缓存与分析记录会一并移除。")
+    c1, c2 = st.columns(2)
+    if c1.button("取消", key=f"hist_cancel_{rid}", width="stretch"):
+        st.rerun()
+    c2.button("确认删除", key=f"hist_confirm_{rid}", type="primary", width="stretch",
+              on_click=_apply_delete, args=(rid,))
+
+
+def _apply_clear(sig: str) -> None:
+    """清空历史并复位相关会话缓存（按钮回调，避免弹窗内状态竞争）。"""
+    history.clear_all()
+    # 当前打开的上传文件保持显示，但不同步回历史，直到用户更换文件
+    st.session_state["_history_no_save_sig"] = sig or None
+    st.session_state.pop("history_active", None)
+    st.session_state.pop("draft", None)
+    st.session_state.pop("draft_key", None)
+    st.session_state.pop("_table_pdf", None)
+    st.rerun()
+
+
+@st.dialog("清空上传历史")
+def confirm_clear(sig: str) -> None:
+    """二次确认：清空全部记录与本地 PDF 缓存。"""
+    count = len(history.list_records())
+    st.write(f"将删除全部 {count} 条上传记录及本地 PDF 缓存，此操作不可恢复。"
+             "当前正在查看的文档会保持打开，但不再保留在历史中。")
+    c1, c2 = st.columns(2)
+    if c1.button("取消", key="hist_clear_cancel", width="stretch"):
+        st.rerun()
+    c2.button("确认清空", key="hist_clear_confirm", type="primary", width="stretch",
+              on_click=_apply_clear, args=(sig,))
+
+
+def sidebar_history(uploaded=None) -> None:
+    """侧边栏上传历史：最近 6 条直接可见，超出滚动，最多保留 12 条。"""
+    records = history.list_records()
+    st.sidebar.markdown('<div class="cb-side-title">上传历史</div>',
+                        unsafe_allow_html=True)
+    st.sidebar.caption("点击记录切换分析 · 最多保留 12 份")
+    if not records:
+        st.sidebar.markdown(
+            '<div class="cb-hist-empty"><b>暂无上传记录</b>'
+            "<span>上传的财报会自动保存在这里，方便随时回看。</span></div>",
+            unsafe_allow_html=True,
+        )
+        return
+
+    sig = f"{uploaded.name}|{uploaded.size}" if uploaded is not None else ""
+    if st.sidebar.button("清空所有记录", key="hist_clear", width="stretch"):
+        confirm_clear(sig)
+
+    box = st.sidebar.container(height=440, border=False)
+    active = st.session_state.get("history_active")
+    with box:
+        for record in records:
+            rid = record["id"]
+            with st.container(border=True):
+                c1, c2 = st.columns([4.5, 1], vertical_alignment="center")
+                label = record.get("name") or "未命名.pdf"
+                if len(label) > 24:
+                    label = label[:22] + "…"
+                if c1.button(label, key=f"hist_open_{rid}", width="stretch",
+                             help="点击打开该文档的分析结果"):
+                    st.session_state["history_active"] = rid
+                    st.rerun()
+                if c2.button("删除", key=f"hist_del_{rid}", width="stretch"):
+                    confirm_delete(rid, record.get("name") or "")
+                meta = " · ".join(x for x in (record.get("uploaded_at"),
+                                              record.get("company")) if x)
+                st.caption(("当前查看 · " if rid == active else "") + meta)
+
+
 # ---------------- 侧边栏 ----------------
 ui.sidebar_brand()
 
 uploaded = st.sidebar.file_uploader("上传年报 PDF", type=["pdf"])
+sidebar_history(uploaded)
+
+# 新上传的文件优先；点击历史记录时切换为历史文档，直到再次上传新文件
+if uploaded is not None:
+    sig = f"{uploaded.name}|{uploaded.size}"
+    if st.session_state.get("_upload_sig") != sig:
+        st.session_state["_upload_sig"] = sig
+        st.session_state.pop("history_active", None)
+        st.session_state.pop("_history_no_save_sig", None)
+
+source = None
+active = st.session_state.get("history_active")
+if active:
+    _record = history.get_record(active)
+    _blob = history.load_bytes(active) if _record else None
+    if _record and _blob is not None:
+        source = _HistoryFile(_record, _blob)
+    else:
+        st.session_state.pop("history_active", None)
+if source is None and uploaded is not None:
+    source = uploaded
 
 scenario = st.sidebar.radio(
     "分析场景", ["研究", "选股", "排雷", "拐点"],
@@ -92,25 +291,31 @@ dividend = st.sidebar.number_input("每股股利（元）", min_value=0.0, value
 dep_amort = st.sidebar.number_input("折旧摊销（元）", min_value=0.0, value=0.0, step=1000.0,
                                     help="取自现金流量表补充资料，用于现金营运指数")
 
-if uploaded is None:
+if source is None:
     ui.landing()
     qa_widget.mount(st.session_state.get("chat", []), ready=False)
     st.stop()
 
-if uploaded.size > MAX_MB * 1024 * 1024:
-    st.error(f"文件 {uploaded.size / 1024 / 1024:.1f}MB 超过 {MAX_MB}MB 上限，请压缩后再上传。")
+if source.size > MAX_MB * 1024 * 1024:
+    st.error(f"文件 {source.size / 1024 / 1024:.1f}MB 超过 {MAX_MB}MB 上限，请压缩后再上传。")
     st.stop()
 
-file_key = f"{uploaded.name}|{uploaded.size}"
+file_key = f"{source.name}|{source.size}"
 if st.session_state.get("draft_key") != file_key:
     st.session_state.pop("draft", None)
+    st.session_state.pop("bench_results", None)
     st.session_state["draft_key"] = file_key
 try:
     with st.spinner("解析财报…"):
-        data = parse_bytes(uploaded.getvalue())
+        data = parse_bytes(source.getvalue())
 except (ParseError, RuntimeError) as e:
     st.error(str(e))
     st.stop()
+
+# 解析成功后写入上传历史（同内容文件自动去重，不改变首次上传时间）；
+# 刚执行「清空所有记录」时，当前打开的文件不再写回，直到用户更换文件。
+if st.session_state.get("_history_no_save_sig") != f"{source.name}|{source.size}":
+    history.add_record(source.name, source.getvalue(), data.get("meta") or {})
 
 index = build_index(data)
 
@@ -139,7 +344,7 @@ if qa_event and qa_event.get("action") == "ask":
     if _question and _nonce and _nonce != st.session_state.get("_qa_nonce"):
         st.session_state["_qa_nonce"] = _nonce
         _use_llm = st.session_state.get("qa_llm", get_llm_client() is not None)
-        _result = qa_answer(_question, data, index=index, use_llm=_use_llm)
+        _result = qa_answer(_question, data, index=index, use_llm=_use_llm, caliber=caliber_map)
         st.session_state.chat.append({"role": "user", "content": _question})
         st.session_state.chat.append({
             "role": "assistant", "content": _result["answer"],
@@ -158,7 +363,8 @@ SCENES = {
              ["拐点信号", "财务比率(36项)", "归因与预测", "投研底稿"]),
 }
 _scene_title, _scene_hint, _scene_tabs = SCENES[scenario]
-_ratio_key = f"ratios|{file_key}|{quick_ratio}|{roe_caliber}"
+_ratio_key = (f"ratios|{file_key}|{quick_ratio}|{roe_caliber}"
+              f"|{price}|{dividend}|{dep_amort}")
 _quick = memo(_ratio_key, lambda: compute_ratios(data, caliber=caliber_map, extra=extra))
 with st.container(border=True):
     st.markdown(f"**{scenario}模式 · {_scene_title}**")
@@ -175,6 +381,8 @@ with st.container(border=True):
         else:
             _col.metric(_name, f"{_v:.2f}{_unit}")
 
+st.caption("提示：报表预览、财务比率、杜邦分析三个页签顶部均提供「表格下载」，"
+           "勾选表格后可一键导出为 PDF。")
 tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs(
     ["报表预览", "财务比率(36项)", "杜邦分析", "溯源证据链", "自定义公式",
      "风险扫描", "拐点信号", "横向对标", "归因与预测", "财报问答", "投研底稿"]
@@ -189,6 +397,16 @@ with tab1:
             st.caption("这些科目名称不在内置词典中，已原样保留在三表里；"
                        "只有被指标公式引用的科目才会影响计算。")
             st.code("、".join(unknown), language=None)
+    sheet_tables = [
+        {"name": label, "frame": df}
+        for label, df in [
+            ("资产负债表", data.get("balance_sheet")),
+            ("利润表", data.get("income")),
+            ("现金流量表", data.get("cashflow")),
+        ]
+        if df is not None
+    ]
+    table_export_panel("sheet", "报表预览", sheet_tables, meta)
     for label, df in [
         ("资产负债表", data.get("balance_sheet")),
         ("利润表", data.get("income")),
@@ -216,11 +434,19 @@ with tab2:
     if ok < len(ratios):
         st.caption("未计算的指标需在左侧补充每股市价、每股股利或折旧摊销。")
 
+    ratio_blocks = []
     for cat in ratios["板块"].drop_duplicates():
         sub = ratios[ratios["板块"] == cat]
-        st.subheader(cat)
+        ratio_blocks.append({
+            "name": cat,
+            "frame": sub[["指标", "重要性", "数值", "单位", "口径", "溯源", "备注"]],
+        })
+    table_export_panel("ratio", "财务比率", ratio_blocks, meta)
+
+    for block in ratio_blocks:
+        st.subheader(block["name"])
         st.dataframe(
-            sub[["指标", "重要性", "数值", "单位", "口径", "溯源", "备注"]],
+            block["frame"],
             width="stretch",
             hide_index=True,
             column_config={
@@ -233,6 +459,7 @@ with tab2:
 with tab3:
     dpt = dupont_analysis(data)
     st.caption("ROE = 销售净利率 × 总资产周转率 × 权益乘数（本期按平均数口径；上期以期末数近似）")
+    table_export_panel("dupont", "杜邦分析", [{"name": "杜邦三因素分解", "frame": dpt}], meta)
     st.dataframe(
         dpt, width="stretch", hide_index=True,
         column_config={
@@ -367,7 +594,7 @@ with tab6:
 
     s1, s2, s3, s4 = st.columns(4)
     s1.metric("Altman Z", "—" if alt["z"] is None else f"{alt['z']:.2f}", alt["zone"])
-    s2.metric("F 分数", f"{f['score']} / 9")
+    s2.metric("F 分数", f"{f['score']} / {f.get('denominator', 9)}")
     s3.metric("五维总分", f"{total:.0f} / 100")
     s4.metric("综合评级", grade(total))
 
@@ -419,11 +646,15 @@ with tab8:
         "批量上传公司年报 PDF（可多选）", type=["pdf"],
         accept_multiple_files=True, key="bench_files",
     )
+    files = files or []
+    if len(files) > MAX_BENCH_FILES:
+        st.warning(f"一次最多对比 {MAX_BENCH_FILES} 家公司，已仅取前 {MAX_BENCH_FILES} 份。")
+        files = files[:MAX_BENCH_FILES]
     results = {meta.get("company") or uploaded.name: data}
-    for file in files or []:
+    for file in files:
         try:
             parsed = parse_bytes(file.getvalue())
-        except ParseError as e:
+        except (ParseError, RuntimeError) as e:
             st.warning(f"{file.name}：{e}")
             continue
         name = parsed.get("meta", {}).get("company") or file.name
@@ -502,17 +733,20 @@ with tab9:
     terminal_growth = f3.slider("永续增长率", 0, 5, 3, 1) / 100.0
 
     base_forecast = forecast(data)
-    scenario = forecast(
+    scenario_fc = forecast(
         data,
         revenue_growth=base_forecast["revenue_growth"] + growth_adjust,
         profit_growth=base_forecast["profit_growth"] + growth_adjust,
     )
+    rev_g_txt = ("数据缺失" if base_forecast["revenue_growth_missing"]
+                 else f"{base_forecast['revenue_growth']:.2%}")
+    profit_g_txt = ("数据缺失" if base_forecast["profit_growth_missing"]
+                    else f"{base_forecast['profit_growth']:.2%}")
     st.caption(
-        f"基准增速：营业收入 {base_forecast['revenue_growth']:.2%}，"
-        f"净利润 {base_forecast['profit_growth']:.2%}；经营现金流按营业收入增速外推；预测期 3 年。"
+        f"基准增速：营业收入 {rev_g_txt}，净利润 {profit_g_txt}；经营现金流按营业收入增速外推；预测期 3 年。"
     )
     st.dataframe(
-        scenario["rows"], width="stretch", hide_index=True,
+        scenario_fc["rows"], width="stretch", hide_index=True,
         column_config={c: st.column_config.NumberColumn(format="%.2f")
                        for c in ("营业收入", "净利润", "经营现金流")},
     )
@@ -523,7 +757,8 @@ with tab9:
         d1, d2, d3 = st.columns(3)
         d1.metric("企业价值（亿元）", f"{dcf_result['enterprise'] / 1e8:.2f}")
         d2.metric("股权价值（亿元）", f"{dcf_result['equity'] / 1e8:.2f}")
-        d3.metric("每股价值（元）", "—" if dcf_result["per_share"] is None
+        d3.metric("每股价值（元）", "—" if (dcf_result["per_share"] is None
+                  or dcf_result["per_share"] < 0)
                   else f"{dcf_result['per_share']:.2f}")
         st.caption(
             f"预测增速（基于营业收入同比）{dcf_result['growth']:.2%}；基期 FCF（经营现金流）"
@@ -563,7 +798,7 @@ with tab10:
         "例如：2025年营业收入是多少？ROE是多少？净利润下降的原因？"
     )
     if question:
-        result = qa_answer(question, data, index=index, use_llm=use_llm_qa)
+        result = qa_answer(question, data, index=index, use_llm=use_llm_qa, caliber=caliber_map)
         st.session_state.chat.append({"role": "user", "content": question})
         st.session_state.chat.append({
             "role": "assistant", "content": result["answer"],

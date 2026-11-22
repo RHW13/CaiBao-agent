@@ -119,6 +119,29 @@ section[data-testid="stSidebar"] .block-container{ padding-top:1.4rem; }
 .cb-brand-text{ font-size:15px; font-weight:700; color:var(--navy); letter-spacing:.03em; }
 .cb-brand-sub{ font-size:11.5px; color:var(--muted); margin:2px 0 14px 40px; }
 
+/* ---------- 侧边栏上传历史 ---------- */
+.cb-side-title{
+  font-size:11px; font-weight:700; letter-spacing:.16em; color:var(--navy-2);
+  text-transform:uppercase; margin:16px 0 2px;
+}
+section[data-testid="stSidebar"] .stButton > button{
+  font-size:12.5px; min-height:34px; padding:4px 8px;
+}
+section[data-testid="stSidebar"] div[data-testid="stVerticalBlockBorderWrapper"]{
+  border-radius:10px !important; background:#FFFFFF;
+}
+.cb-hist-empty{
+  border:1px dashed var(--line); border-radius:12px; background:#FDFEFF;
+  padding:18px 14px; text-align:center; margin-top:2px;
+}
+.cb-hist-empty b{ display:block; font-size:13px; color:var(--navy); margin-bottom:4px; }
+.cb-hist-empty span{ font-size:12px; color:var(--muted); line-height:1.6; }
+@media (max-width:640px){
+  section[data-testid="stSidebar"] .block-container{
+    padding-left:.7rem !important; padding-right:.7rem !important;
+  }
+}
+
 /* ---------- 上传区与按钮 ---------- */
 [data-testid="stFileUploader"] section{
   border:1.5px dashed #B9CFE8; border-radius:var(--radius); background:#FDFEFF;

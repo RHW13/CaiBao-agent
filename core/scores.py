@@ -57,8 +57,13 @@ def altman_z(data: dict, market_value: float = None) -> dict:
 
 # ---------------- Piotroski F-score ----------------
 
+def _trio(avail: bool, ok_fn) -> object:
+    """三态判定：数据缺失返回 None，否则返回 bool(ok_fn())。ok_fn 惰性求值避免 None 运算。"""
+    return None if not avail else bool(ok_fn())
+
+
 def f_score(data: dict) -> dict:
-    """9 项二元检查，每项 1 分。"""
+    """9 项二元检查，每项 1 分；数据缺失的检查项不参与计分（不猜值）。"""
     roa = eval_text(data, "净利润 / 资产总计_平均")
     roa_prev = eval_text(data, "净利润_上期 / 资产总计_上期")
     cfo = data.get("经营活动产生的现金流量净额")
@@ -74,32 +79,41 @@ def f_score(data: dict) -> dict:
     shares, shares_prev = data.get("股本"), data.get("股本_上期")
 
     checks = [
-        ("ROA > 0", roa is not None and roa > 0, _fmt(roa, True)),
-        ("经营现金流 > 0", cfo is not None and cfo > 0,
+        ("ROA > 0", _trio(roa is not None, lambda: roa > 0), _fmt(roa, True)),
+        ("经营现金流 > 0", _trio(cfo is not None, lambda: cfo > 0),
          "缺失" if cfo is None else f"{cfo / 1e8:.2f} 亿元"),
-        ("ROA 同比提升", roa is not None and roa_prev is not None and roa > roa_prev,
+        ("ROA 同比提升",
+         _trio(roa is not None and roa_prev is not None, lambda: roa > roa_prev),
          f"{_fmt(roa_prev, True)} → {_fmt(roa, True)}"),
         ("应计质量（现金流 > ROA）",
-         cfo_ratio is not None and roa is not None and cfo_ratio > roa,
+         _trio(cfo_ratio is not None and roa is not None, lambda: cfo_ratio > roa),
          f"现金流/资产 {_fmt(cfo_ratio, True)} vs ROA {_fmt(roa, True)}"),
         ("长期负债率下降",
-         lev is not None and lev_prev is not None and lev < lev_prev,
+         _trio(lev is not None and lev_prev is not None, lambda: lev < lev_prev),
          f"{_fmt(lev_prev, True)} → {_fmt(lev, True)}"),
         ("流动比率提升",
-         cr is not None and cr_prev is not None and cr > cr_prev,
+         _trio(cr is not None and cr_prev is not None, lambda: cr > cr_prev),
          f"{_fmt(cr_prev)} → {_fmt(cr)}"),
         ("未增发股本",
-         shares is not None and shares_prev is not None and abs(shares - shares_prev) < 1e-6,
+         _trio(shares is not None and shares_prev is not None,
+               lambda: abs(shares - shares_prev) < 1e-6),
          "缺失" if shares is None else f"{shares / 1e8:.2f} 亿股"),
         ("毛利率提升",
-         gm is not None and gm_prev is not None and gm > gm_prev,
+         _trio(gm is not None and gm_prev is not None, lambda: gm > gm_prev),
          f"{_fmt(gm_prev, True)} → {_fmt(gm, True)}"),
         ("总资产周转率提升",
-         at is not None and at_prev is not None and at > at_prev,
+         _trio(at is not None and at_prev is not None, lambda: at > at_prev),
          f"{_fmt(at_prev)} → {_fmt(at)}"),
     ]
-    rows = [{"项目": name, "通过": bool(ok), "说明": detail} for name, ok, detail in checks]
-    return {"score": sum(r["通过"] for r in rows), "rows": rows}
+    rows, passed, total = [], 0, 0
+    for name, ok, detail in checks:
+        if ok is None:
+            rows.append({"项目": name, "通过": None, "说明": "数据缺失"})
+        else:
+            total += 1
+            passed += int(ok)
+            rows.append({"项目": name, "通过": bool(ok), "说明": detail})
+    return {"score": passed, "denominator": total, "rows": rows}
 
 
 # ---------------- 五维评分 ----------------

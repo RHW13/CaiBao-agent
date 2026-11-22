@@ -11,6 +11,13 @@ KEY_INDICATORS = [
     "净资产收益率(ROE)", "总资产周转率", "存货周转率", "净现比(盈余现金保障倍数)",
 ]
 
+# 各对标指标的单位（用于在对比表/汇总表中标注，避免 % 与倍等混排误读）
+_KEY_UNITS = {
+    "流动比率": "倍", "速动比率": "倍", "资产负债率": "%",
+    "销售毛利率": "%", "销售净利率": "%", "净资产收益率(ROE)": "%",
+    "总资产周转率": "次", "存货周转率": "次", "净现比(盈余现金保障倍数)": "倍",
+}
+
 
 def compare(results: dict):
     """results: {公司名: pdf_data} → (明细表, 汇总表)。
@@ -23,12 +30,16 @@ def compare(results: dict):
         columns[name] = ratios.set_index("指标")["数值"]
     detail = pd.DataFrame(columns)
     detail = detail.reindex([i for i in KEY_INDICATORS if i in detail.index])
+    # 指标名附加单位，避免无单位混排导致误读
+    detail = detail.rename(index=lambda i: f"{i}（{_KEY_UNITS.get(i, '')}）")
 
     rows = []
     for indicator, row in detail.iterrows():
+        base_name = indicator.split("（")[0]
         values = row.dropna()
         rows.append({
-            "指标": indicator,
+            "指标": base_name,
+            "单位": _KEY_UNITS.get(base_name, ""),
             "均值": values.mean() if len(values) else None,
             "中位数": values.median() if len(values) else None,
             "25分位": values.quantile(0.25) if len(values) else None,
