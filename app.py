@@ -40,24 +40,42 @@ ui.apply_theme()
 st.session_state.setdefault("chat", [])
 
 # ---------------- 身份识别：账号登录态 + 设备唯一标识 ----------------
-_ident = identity_widget.mount(
-    set_token=st.session_state.pop("_issue_token", ""),
-    clear_token=st.session_state.pop("_clear_token", False),
-) or {}
-_device_id = str(_ident.get("device_id") or "").strip()
-_token = str(_ident.get("token") or "").strip()
-_auth_user = identity.user_from_token(_token)
+# 身份识别与旧数据迁移属于增强能力：任一步失败都退回「访客设备」主体，
+# 不让启动期异常阻断整个页面（也兼容热更新后旧模块仍驻留 sys.modules 的情况）。
+_ident, _device_id, _token, _auth_user = {}, "", "", None
+try:
+    _ident = identity_widget.mount(
+        set_token=st.session_state.pop("_issue_token", ""),
+        clear_token=st.session_state.pop("_clear_token", False),
+    ) or {}
+    _device_id = str(_ident.get("device_id") or "").strip()
+    _token = str(_ident.get("token") or "").strip()
+    _auth_user = identity.user_from_token(_token)
+except Exception:                    # 组件不可用：按设备主体继续运行
+    st.session_state["_identity_degraded"] = True
+
 if _auth_user:
     st.session_state["auth_user"] = _auth_user
     st.session_state["auth_token"] = _token
 else:
     st.session_state.pop("auth_user", None)
     st.session_state.pop("auth_token", None)
+
 # 主体在服务端由身份计算，前端不可指定，保证越权访问无从下手
 SUBJECT = identity.subject(_auth_user, _device_id)
 SUBJECT_LABEL = identity.subject_label(_auth_user, _device_id)
-if _ident:
-    history.migrate_legacy(SUBJECT)
+
+_migrate = getattr(history, "migrate_legacy", None)
+if _device_id and callable(_migrate):
+    try:
+        _migrate(SUBJECT)
+    except Exception:                # 迁移失败不影响正常使用
+        pass
+
+# 历史模块接口自检：热更新后若旧模块仍在内存中，宁可降级也不抛错
+_HISTORY_API = ("list_records", "get_record", "load_bytes", "add_record",
+                "delete_record", "clear_all", "record_status", "total_size")
+HISTORY_OK = all(hasattr(history, name) for name in _HISTORY_API)
 
 MAX_MB = 50
 # 单次横向对标最多纳入的文件数（含当前已上传公司），避免批量上传占满内存
@@ -279,7 +297,8 @@ class _HistoryFile:
 
 def _apply_delete(rid: str) -> None:
     """删除单条记录并复位相关会话缓存（按钮回调）。"""
-    history.delete_record(SUBJECT, rid)
+    if HISTORY_OK:
+        history.delete_record(SUBJECT, rid)
     if st.session_state.get("history_active") == rid:
         st.session_state.pop("history_active", None)
         st.session_state.pop("draft", None)
@@ -301,7 +320,8 @@ def confirm_delete(rid: str, name: str) -> None:
 
 def _apply_clear(sig: str) -> None:
     """清空历史并复位相关会话缓存（按钮回调，避免弹窗内状态竞争）。"""
-    history.clear_all(SUBJECT)
+    if HISTORY_OK:
+        history.clear_all(SUBJECT)
     # 当前打开的上传文件保持显示，但不同步回历史，直到用户更换文件
     st.session_state["_history_no_save_sig"] = sig or None
     st.session_state.pop("history_active", None)
@@ -314,7 +334,7 @@ def _apply_clear(sig: str) -> None:
 @st.dialog("清空上传历史")
 def confirm_clear(sig: str) -> None:
     """二次确认：清空全部记录与本地 PDF 缓存。"""
-    count = len(history.list_records(SUBJECT))
+    count = len(history.list_records(SUBJECT)) if HISTORY_OK else 0
     st.write(f"将删除全部 {count} 条上传记录及本地 PDF 缓存，此操作不可恢复。"
              "当前正在查看的文档会保持打开，但不再保留在历史中。")
     c1, c2 = st.columns(2)
@@ -329,6 +349,8 @@ def sidebar_identity() -> None:
     user = st.session_state.get("auth_user")
     with st.sidebar.expander("账号已登录" if user else "身份与登录", expanded=not user):
         st.caption(f"当前主体：{SUBJECT_LABEL}")
+        if st.session_state.get("_identity_degraded"):
+            st.caption("身份组件暂不可用，已按设备身份继续运行。")
         if user:
             st.caption("历史记录已绑定到账号，退出后回到本设备身份。")
             if st.button("退出登录", key="logout_btn", width="stretch"):
@@ -367,6 +389,9 @@ def history_page() -> None:
     """当前身份主体的专属历史记录页：列表、时间筛选、逐条删除。"""
     role = "账号" if st.session_state.get("auth_user") else "设备"
     st.markdown("## 我的历史记录")
+    if not HISTORY_OK:
+        st.warning("历史记录模块版本不匹配，请重启应用（Reboot app）后再试。")
+        return
     st.caption(f"当前身份：{SUBJECT_LABEL}（按{role}维度隔离）。"
                "此处仅列出并允许操作该身份上传的财报，其他用户/设备的数据不可见。")
 
@@ -443,6 +468,9 @@ def history_page() -> None:
 
 def sidebar_history(uploaded=None) -> None:
     """侧边栏上传历史（紧凑布局）：标题与清空按钮同行，列表滚动查看。"""
+    if not HISTORY_OK:
+        st.sidebar.caption("历史记录模块版本不匹配，重启应用后可用。")
+        return
     records = history.list_records(SUBJECT)
     sig = f"{uploaded.name}|{uploaded.size}" if uploaded is not None else ""
     title_col, action_col = st.sidebar.columns([2.4, 1], gap="small",
@@ -509,7 +537,7 @@ if uploaded is not None:
 
 source = None
 active = st.session_state.get("history_active")
-if active:
+if HISTORY_OK and active:
     _record = history.get_record(SUBJECT, active)
     _blob = history.load_bytes(SUBJECT, active) if _record else None
     if _record and _blob is not None:
@@ -565,7 +593,7 @@ except (ParseError, RuntimeError) as e:
 
 # 解析成功后写入上传历史（同内容文件自动去重，不改变首次上传时间）；
 # 刚执行「清空所有记录」时，当前打开的文件不再写回，直到用户更换文件。
-if st.session_state.get("_history_no_save_sig") != f"{source.name}|{source.size}":
+if HISTORY_OK and st.session_state.get("_history_no_save_sig") != f"{source.name}|{source.size}":
     history.add_record(SUBJECT, source.name, source.getvalue(), data.get("meta") or {})
 
 index = build_index(data)
