@@ -23,7 +23,7 @@ from core.trend import trend_panel, backtest
 from core.benchmark import compare, bar_chart, score_matrix
 from core.attribution import dupont_attribution, gross_margin_breakdown, mdna_evidence
 from core.forecast import forecast, dcf
-from core.qa import answer as qa_answer
+from core.qa import answer as qa_answer, llm_stream, validate_answer
 from core.draft import CHAPTERS, assemble, to_docx, to_markdown, to_pdf, tables_to_pdf
 from core.config import get_llm_client
 import ui_theme as ui
@@ -182,10 +182,19 @@ RISK_HELP = {
 }
 
 
+_MEMO_MAX = 64
+
+
 def memo(key: str, factory):
-    """会话内缓存重计算结果（避免每次点控件都重算附注检索/评分）。"""
+    """会话内缓存重计算结果（避免每次点控件都重算附注检索/评分）。
+
+    最多保留 64 项，超出后按插入顺序淘汰，避免反复切换参数导致会话内存增长。
+    """
     store = st.session_state.setdefault("_memo", {})
     if key not in store:
+        if len(store) >= _MEMO_MAX:
+            for old in list(store)[: len(store) - _MEMO_MAX + 1]:
+                store.pop(old, None)
         store[key] = factory()
     return store[key]
 
@@ -728,8 +737,10 @@ with tab1:
     table_export_panel("sheet", "报表预览", sheet_tables, meta)
 
 with tab2:
-    ratios = memo(_ratio_key, lambda: compute_ratios(data, caliber=caliber_map, extra=extra)).copy()
-    ratios = attach_evidence(index, ratios, use_llm=False)
+    # 溯源计算较重（36 指标 × 全表模糊匹配），按文件+口径缓存，避免每次交互重算
+    ratios = memo(_ratio_key + "|evidence", lambda: attach_evidence(
+        index, compute_ratios(data, caliber=caliber_map, extra=extra), use_llm=False,
+    )).copy()
     ratios["备注"] = [
         f"{c}；{n}" if c and n else (c or n)
         for c, n in zip(ratios["置信"], ratios["备注"])
@@ -1121,19 +1132,56 @@ with tab10:
     for msg in st.session_state.get("chat", []):
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
+            if msg.get("confidence") is not None:
+                st.caption(f"置信度 {msg['confidence']:.0%} · {msg.get('basis', '')}")
             for citation in msg.get("citations", []):
-                with st.expander(f"第 {citation['page']} 页"):
+                label = f"{citation['company']} " if citation.get("company") else ""
+                with st.expander(f"{label}第 {citation['page']} 页"):
                     st.code(citation["snippet"], language=None)
 
-    question = st.chat_input(
+    _examples = ("营业收入是多少？", "ROE 是多少？", "净利润变化的原因？")
+    if not st.session_state.get("chat"):
+        cols = st.columns(len(_examples))
+        for i, ex in enumerate(_examples):
+            if cols[i].button(ex, key=f"qa_example_{i}", width="stretch"):
+                st.session_state["_qa_prompt"] = ex
+
+    typed = st.chat_input(
         "例如：2025年营业收入是多少？ROE是多少？净利润下降的原因？"
     )
-    if question:
-        result = qa_answer(question, data, index=index, use_llm=use_llm_qa, caliber=caliber_map)
-        st.session_state.chat.append({"role": "user", "content": question})
+    if typed:
+        st.session_state["_qa_prompt"] = typed
+
+    prompt = st.session_state.pop("_qa_prompt", None)
+    if prompt:
+        # 同行数据来自「横向对标」页已加载的公司（最多 4 家），不主动解析新文件
+        peers = [{"company": name, "pdf_data": pdf}
+                 for name, pdf in (st.session_state.get("bench_results") or {}).items()
+                 if pdf is not data][:4]
+        history = [m for m in st.session_state.get("chat", [])
+                   if m.get("role") == "user"][-5:]
+        result = qa_answer(prompt, data, index=index, use_llm=False,
+                           caliber=caliber_map, history=history, peers=peers)
+        content = result["answer"]
+        conf, basis = result.get("confidence", 0.0), result.get("basis", "")
+
+        if result["route"] == "text" and use_llm_qa and get_llm_client() is not None:
+            st.session_state.chat.append({"role": "user", "content": prompt})
+            with st.chat_message("assistant"):
+                streamed = st.write_stream(llm_stream(prompt, result["citations"]))
+            checked = validate_answer(streamed or "", result["citations"]) if streamed else ""
+            if checked:
+                content = checked
+                conf, basis = 0.85, "LLM 生成，已通过引用与数字回查"
+            else:
+                conf, basis = 0.70, "LLM 未通过校验，已回退原文摘录"
+        else:
+            st.session_state.chat.append({"role": "user", "content": prompt})
+
         st.session_state.chat.append({
-            "role": "assistant", "content": result["answer"],
+            "role": "assistant", "content": content,
             "citations": result["citations"],
+            "confidence": conf, "basis": basis,
         })
         st.rerun()
 

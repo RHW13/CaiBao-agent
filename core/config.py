@@ -41,8 +41,9 @@ def get_llm_model() -> str:
     return _get("DEEPSEEK_MODEL", "deepseek-chat")
 
 
+@lru_cache(maxsize=1)
 def get_llm_client():
-    """返回 OpenAI SDK 客户端；未配置 Key 时返回 None。"""
+    """返回 OpenAI SDK 客户端（进程内复用连接池）；未配置 Key 时返回 None。"""
     key = get_llm_api_key()
     if not key:
         return None

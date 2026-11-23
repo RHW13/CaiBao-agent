@@ -5,6 +5,7 @@
 """
 import difflib
 from collections import OrderedDict
+from functools import lru_cache
 
 from .calibers import get_caliber
 from .evaluator import parse_formula, FormulaError, iter_vars
@@ -49,6 +50,7 @@ def _formula_of(ind: dict) -> str:
     return ""
 
 
+@lru_cache(maxsize=None)
 def indicator_accounts(name: str) -> list:
     """返回某个指标公式引用的规范科目键（去重，按出现顺序）。"""
     for ind in INDICATORS:
