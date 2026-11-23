@@ -57,11 +57,14 @@ def extract_pages(path: str) -> list:
 
 # 三表标题：兼容「合并资产负债表」「合并及母公司资产负债表」「合并及公司资产负债表」
 # 「母公司资产负债表」「资产负债表」等写法。银行/保险/证券等金融企业报表标题一致。
-_TITLE_PREFIX = r"(?<!的)(?:合并及母公司|合并及公司|合并|母公司|公司)?"
+_TITLE_PREFIX = r"(?<!的)(?:合并及母公司|合并及银行|合并及公司|合并|母公司|公司)?"
 _STMT_TITLES = {
-    "balance_sheet": re.compile(_TITLE_PREFIX + r"资产负债表"),
-    "income": re.compile(_TITLE_PREFIX + r"(?:利润表|损益表)"),
-    "cashflow": re.compile(_TITLE_PREFIX + r"现金流量表"),
+    "balance_sheet": re.compile(
+        _TITLE_PREFIX + r"资产负债表(?:[和及](?:母公司|公司)?资产负债表)?"),
+    "income": re.compile(
+        _TITLE_PREFIX + r"(?:利润表|损益表)(?:[和及](?:母公司|公司)?(?:利润表|损益表))?"),
+    "cashflow": re.compile(
+        _TITLE_PREFIX + r"现金流量表(?:[和及](?:母公司|公司)?现金流量表)?"),
 }
 
 # 报表页锚点科目：标题与数值同页但无法取得独立标题词时，用锚点确认该页确为报表页，
@@ -116,6 +119,34 @@ def _is_statement_page(page: dict) -> bool:
     return n >= _DENSE_NUMS
 
 
+# 附注小节起始页特征：位于页首（公司名之后）。报表正文必然在附注之前，
+# 遇到附注首页即停止搜索，避免把附注中的分表（如「…补充说明」）误当作报表。
+_NOTES_HEADER = ("财务报表附注", "財務報表附註")
+
+
+def _is_notes(page: dict) -> bool:
+    """附注首页：页首前几个词中出现独立的「财务报表附注」标题。
+
+    不能按文本包含判断——正文里「…载于财务报表附注三」这类引用很常见，
+    只有页首的标题词才代表进入附注小节。
+    """
+    for w in page["words"][:4]:
+        text = w["text"].strip()
+        if text in _NOTES_HEADER:
+            return True
+        if len(text) <= 14 and text.startswith(_NOTES_HEADER):
+            return True
+    return False
+
+
+def _is_index_page(page: dict) -> bool:
+    """报表目录/附录首页：同一页并列列出多张报表标题，不是报表正文。"""
+    text = page["text"]
+    if not ("财务报表：" in text or text.startswith("附录")):
+        return False
+    return sum(1 for pat in _STMT_TITLES.values() if _title_hits(page, pat)) >= 2
+
+
 # 报表标题词前的序号前缀（如「1、」「（一）」「一、」）与「（续）」后缀
 _TITLE_STRIP = re.compile(r"^(?:\d+[、.．]|[（(][一二三四五六七八九十\d]+[）)]|[一二三四五六七八九十]+、)")
 _TITLE_TAIL = re.compile(r"[（(]续[）)]$")
@@ -146,6 +177,10 @@ def _pick(pattern, pages: list, cursor: int, accept, anchors=None) -> int:
     for i, p in enumerate(pages):
         if p["page"] <= cursor or _is_toc(p):
             continue
+        if _is_notes(p):
+            break  # 已进入附注，其后不再有报表正文
+        if _is_index_page(p):
+            continue  # 报表目录/附录页，仅列出标题
         hits = _title_hits(p, pattern)
         if not hits:
             if not accept(p):
@@ -183,7 +218,9 @@ def detect_statement_pages(pages: list) -> dict:
     优先选用含「合并」的报表页；仅当全本无合并报表时才回退到母公司报表。
     """
     result = {}
-    cursor = 0
+    # 财务报表位于审计报告之后：以审计意见页为下界，避免管理层讨论中的
+    # 「利润表分析」等表格被误判为正式报表。
+    cursor = max(0, _audit_page(pages) - 1)
     for stmt in ("balance_sheet", "income", "cashflow"):
         picked = _pick(_STMT_TITLES[stmt], pages, cursor, _is_statement_page,
                        _STMT_ANCHORS[stmt])
@@ -191,3 +228,20 @@ def detect_statement_pages(pages: list) -> dict:
         if picked:
             cursor = picked
     return result
+
+
+def _audit_page(pages: list) -> int:
+    """首个审计/审阅意见页的页码；找不到返回 0。
+
+    半年报通常不审计但含审阅报告，报表同样位于其后。
+    """
+    for p in pages:
+        if _is_toc(p):
+            continue
+        text = p["text"]
+        audited = ("审计报告" in text and ("审计意见" in text or "关键审计事项" in text
+                                         or "關鍵審計事項" in text))
+        reviewed = ("审阅报告" in text or "审阅意见" in text or "审阅结论" in text)
+        if audited or reviewed:
+            return p["page"]
+    return 0

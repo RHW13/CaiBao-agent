@@ -18,17 +18,6 @@ CALIBERS = {
     },
 }
 
-CALIBER_LABELS = {
-    "标准": "标准口径",
-    "严格": "严格口径",
-    "期末口径": "期末口径",
-}
-
-
-def list_calibers() -> dict:
-    """返回 {指标名: [口径名, ...]}。"""
-    return {k: list(v.keys()) for k, v in CALIBERS.items()}
-
 
 def get_caliber(indicator: str, caliber: str) -> str:
     """返回指定指标在指定口径下的公式字符串；口径不存在时回退到第一个口径。"""

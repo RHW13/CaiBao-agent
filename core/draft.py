@@ -21,7 +21,6 @@ from .scores import altman_z, f_score, five_dimension_scores, grade
 from .trend import trend_panel
 
 CHAPTERS = ["公司概览", "财务体检", "风险清单", "拐点信号", "结论", "跟踪清单"]
-_LEVEL_ORDER = {"高": 0, "中": 1, "低": 2}
 
 _SYS_PROMPT = (
     "你是投研底稿撰写助手。只能使用给定事实中的数据，不得引入外部知识，不得自行计算新数字。\n"

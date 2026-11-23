@@ -4,12 +4,13 @@
 """
 import os
 import tempfile
+from datetime import datetime
 
 import pandas as pd
 import streamlit as st
 
 from core.statements import load_pdf
-from core import history
+from core import history, identity
 from core.pdf_loader import ParseError
 from core.pdf_index import build_index
 from core.evidence import indicator_evidence, attach_evidence
@@ -27,6 +28,7 @@ from core.draft import CHAPTERS, assemble, to_docx, to_markdown, to_pdf, tables_
 from core.config import get_llm_client
 import ui_theme as ui
 import qa_widget_component as qa_widget
+import identity_widget_component as identity_widget
 
 st.set_page_config(
     page_title="财报分析智能体",
@@ -37,9 +39,128 @@ st.set_page_config(
 ui.apply_theme()
 st.session_state.setdefault("chat", [])
 
+# ---------------- 身份识别：账号登录态 + 设备唯一标识 ----------------
+_ident = identity_widget.mount(
+    set_token=st.session_state.pop("_issue_token", ""),
+    clear_token=st.session_state.pop("_clear_token", False),
+) or {}
+_device_id = str(_ident.get("device_id") or "").strip()
+_token = str(_ident.get("token") or "").strip()
+_auth_user = identity.user_from_token(_token)
+if _auth_user:
+    st.session_state["auth_user"] = _auth_user
+    st.session_state["auth_token"] = _token
+else:
+    st.session_state.pop("auth_user", None)
+    st.session_state.pop("auth_token", None)
+# 主体在服务端由身份计算，前端不可指定，保证越权访问无从下手
+SUBJECT = identity.subject(_auth_user, _device_id)
+SUBJECT_LABEL = identity.subject_label(_auth_user, _device_id)
+if _ident:
+    history.migrate_legacy(SUBJECT)
+
 MAX_MB = 50
 # 单次横向对标最多纳入的文件数（含当前已上传公司），避免批量上传占满内存
 MAX_BENCH_FILES = 20
+
+RISK_HELP = {
+    "z": {
+        "title": "Altman Z 评分标准",
+        "body": """
+**模型选择**
+
+- 输入了每股市价且能取到股本时，使用上市制造业模型 **Z**（X4 用股权市值）；
+- 未提供市值时，退化为非上市模型 **Z′**（X4 用账面净资产）。
+
+**计算逻辑**
+
+- Z = 1.2·X1 + 1.4·X2 + 3.3·X3 + 0.6·X4 + 1.0·X5
+- Z′ = 0.717·X1 + 0.847·X2 + 3.107·X3 + 0.420·X4 + 0.998·X5
+
+| 变量 | 含义 | 计算口径 |
+| --- | --- | --- |
+| X1 | 营运资本 / 总资产 | (流动资产合计 − 流动负债合计) / 资产总计 |
+| X2 | 留存收益 / 总资产 | (盈余公积 + 未分配利润) / 资产总计 |
+| X3 | 息税前利润 / 总资产 | (利润总额 + 利息费用) / 资产总计 |
+| X4 | 股权价值 / 总负债 | 上市：市值 / 负债合计；非上市：所有者权益合计 / 负债合计 |
+| X5 | 总资产周转率 | 营业收入 / 资产总计 |
+
+**判定标准**
+
+| 模型 | 安全 | 灰色 | 危险 |
+| --- | --- | --- | --- |
+| Z | Z > 2.99 | 1.81 ≤ Z ≤ 2.99 | Z < 1.81 |
+| Z′ | Z′ > 2.90 | 1.23 ≤ Z′ ≤ 2.90 | Z′ < 1.23 |
+
+任一变量无法计算时显示「数据不足」，不做缺失值猜测。
+""",
+    },
+    "f": {
+        "title": "Piotroski F 分数评分标准",
+        "body": """
+**计分规则**
+
+9 项二元检查，每项满足记 1 分、不满足记 0 分；数据缺失的检查项**不计入分母**，
+因此显示为「得分 / 实际可判定项数」，而不是固定 9 分。
+
+| 检查项 | 通过条件 | 计算口径 |
+| --- | --- | --- |
+| ROA > 0 | 本期为正 | 净利润 / 平均总资产 |
+| 经营现金流 > 0 | 本期为正 | 经营活动产生的现金流量净额 |
+| ROA 同比提升 | 本期 > 上期 | 净利润 / 平均总资产，与上期比较 |
+| 应计质量 | 现金流回报 > ROA | 经营现金流 / 平均总资产 > ROA |
+| 长期负债率下降 | 本期 < 上期 | 非流动负债合计 / 资产总计 |
+| 流动比率提升 | 本期 > 上期 | 流动资产合计 / 流动负债合计 |
+| 未增发股本 | 两期股本一致 | 本期股本 = 上期股本 |
+| 毛利率提升 | 本期 > 上期 | (营业收入 − 营业成本) / 营业收入 |
+| 总资产周转率提升 | 本期 > 上期 | 营业收入 / 平均总资产 |
+
+**解读**：7–9 分为财务状况稳健，4–6 分为中性，0–3 分为存在明显财务压力；
+分母小于 9 时说明报表缺少上期数或相关科目，结论需结合缺失项判断。
+""",
+    },
+    "dim": {
+        "title": "五维总分评分标准",
+        "body": """
+**计分规则**
+
+五个维度各 20 分，单维得分 = 20 × 通过项数 / 该维可判定项数；
+数据缺失的检查项不参与该维度的分母，五项相加为总分（满分 100）。
+
+| 维度 | 检查项（通过条件） |
+| --- | --- |
+| 偿债能力 | 资产负债率 ≤ 50%；流动比率 ≥ 1.2；速动比率 ≥ 0.8；利息保障倍数 ≥ 3 |
+| 盈利能力 | ROE ≥ 8%；净利率 ≥ 3%；毛利率 ≥ 20%；ROA ≥ 3% |
+| 营运能力 | 应收账款周转率 ≥ 4；存货周转率 ≥ 4；总资产周转率 ≥ 0.6 |
+| 成长能力 | 营业收入同比 > 0；净利润同比 > 0；总资产同比 > 0 |
+| 现金流质量 | 经营现金流 > 0；净现比 ≥ 0.8；销售收现比率 ≥ 0.9；现金流量比率 ≥ 0.1 |
+
+**口径说明**
+
+- 涉及「平均」的指标按 (本期 + 上期) / 2 计算；
+- 银行、保险等报表没有流动资产、存货、营业成本时，对应检查项按数据缺失处理，
+  不扣分，也不计为通过。
+""",
+    },
+    "grade": {
+        "title": "综合评级判定标准",
+        "body": """
+**判定逻辑**
+
+综合评级由五维总分（0–100）直接映射，不额外加权：
+
+| 总分区间 | 评级 | 含义 |
+| --- | --- | --- |
+| ≥ 80 | 优秀 | 五项能力均衡且多数指标达标 |
+| 60 – 79.9 | 良好 | 整体稳健，个别维度存在短板 |
+| 40 – 59.9 | 一般 | 多项指标未达标，需关注经营与偿债压力 |
+| < 40 | 较差 | 多数维度不达标，财务风险较高 |
+
+**注意**：评级仅依据公开报表的规则化打分，不含行业景气、公司治理等定性因素，
+不构成投资建议；若总分接近分档边界，应结合明细表与风险信号综合判断。
+""",
+    },
+}
 
 
 def memo(key: str, factory):
@@ -158,7 +279,7 @@ class _HistoryFile:
 
 def _apply_delete(rid: str) -> None:
     """删除单条记录并复位相关会话缓存（按钮回调）。"""
-    history.delete_record(rid)
+    history.delete_record(SUBJECT, rid)
     if st.session_state.get("history_active") == rid:
         st.session_state.pop("history_active", None)
         st.session_state.pop("draft", None)
@@ -180,7 +301,7 @@ def confirm_delete(rid: str, name: str) -> None:
 
 def _apply_clear(sig: str) -> None:
     """清空历史并复位相关会话缓存（按钮回调，避免弹窗内状态竞争）。"""
-    history.clear_all()
+    history.clear_all(SUBJECT)
     # 当前打开的上传文件保持显示，但不同步回历史，直到用户更换文件
     st.session_state["_history_no_save_sig"] = sig or None
     st.session_state.pop("history_active", None)
@@ -193,7 +314,7 @@ def _apply_clear(sig: str) -> None:
 @st.dialog("清空上传历史")
 def confirm_clear(sig: str) -> None:
     """二次确认：清空全部记录与本地 PDF 缓存。"""
-    count = len(history.list_records())
+    count = len(history.list_records(SUBJECT))
     st.write(f"将删除全部 {count} 条上传记录及本地 PDF 缓存，此操作不可恢复。"
              "当前正在查看的文档会保持打开，但不再保留在历史中。")
     c1, c2 = st.columns(2)
@@ -203,37 +324,156 @@ def confirm_clear(sig: str) -> None:
               on_click=_apply_clear, args=(sig,))
 
 
+def sidebar_identity() -> None:
+    """侧边栏身份区：未登录可注册 / 登录，已登录可退出。"""
+    user = st.session_state.get("auth_user")
+    with st.sidebar.expander("账号已登录" if user else "身份与登录", expanded=not user):
+        st.caption(f"当前主体：{SUBJECT_LABEL}")
+        if user:
+            st.caption("历史记录已绑定到账号，退出后回到本设备身份。")
+            if st.button("退出登录", key="logout_btn", width="stretch"):
+                identity.logout(st.session_state.get("auth_token"))
+                st.session_state["_clear_token"] = True
+                st.session_state.pop("auth_user", None)
+                st.session_state.pop("auth_token", None)
+                st.session_state.pop("history_active", None)
+                st.rerun()
+            return
+
+        tab_login, tab_reg = st.tabs(["登录", "注册"])
+        with tab_login, st.form("login_form"):
+            lu = st.text_input("用户名", key="login_user")
+            lp = st.text_input("密码", type="password", key="login_pwd")
+            if st.form_submit_button("登录", width="stretch"):
+                ok, res = identity.login(lu, lp)
+                if ok:
+                    st.session_state["_issue_token"] = res
+                    st.rerun()
+                st.error(res) if not ok else None
+        with tab_reg, st.form("register_form"):
+            ru = st.text_input("用户名", key="reg_user", help="字母、数字、下划线、点、短横线、@ 或中文")
+            rp = st.text_input("密码（至少 6 位）", type="password", key="reg_pwd")
+            rp2 = st.text_input("确认密码", type="password", key="reg_pwd2")
+            if st.form_submit_button("注册", width="stretch"):
+                if rp != rp2:
+                    st.error("两次输入的密码不一致。")
+                else:
+                    ok, res = identity.register(ru, rp)
+                    st.success(res) if ok else st.error(res)
+        st.caption("未登录时按设备标识隔离；登录后历史归属到账号，换设备登录同样可见。")
+
+
+def history_page() -> None:
+    """当前身份主体的专属历史记录页：列表、时间筛选、逐条删除。"""
+    role = "账号" if st.session_state.get("auth_user") else "设备"
+    st.markdown("## 我的历史记录")
+    st.caption(f"当前身份：{SUBJECT_LABEL}（按{role}维度隔离）。"
+               "此处仅列出并允许操作该身份上传的财报，其他用户/设备的数据不可见。")
+
+    records = history.list_records(SUBJECT, limit=1000)
+    if not records:
+        st.info("当前身份暂无上传记录。切换到「财报分析」上传财报后会自动出现在这里。")
+        return
+
+    dates = sorted({r.get("uploaded_at", "")[:10] for r in records if r.get("uploaded_at")})
+    if dates:
+        picked = st.date_input(
+            "时间范围",
+            value=(datetime.strptime(dates[0], "%Y-%m-%d").date(),
+                   datetime.strptime(dates[-1], "%Y-%m-%d").date()),
+            key="hist_range",
+        )
+        if isinstance(picked, (tuple, list)):
+            start, end = (picked[0], picked[-1]) if picked else (None, None)
+        else:
+            start = end = picked
+        filtered = [
+            r for r in records
+            if start and start.isoformat() <= (r.get("uploaded_at", "")[:10] or "0000")
+            <= end.isoformat()
+        ]
+    else:
+        start = end = None
+        filtered = records
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("记录数", f"{len(filtered)} / {len(records)}")
+    m2.metric("文件总大小", f"{history.total_size(filtered) / 1024 / 1024:.2f} MB")
+    m3.metric("时间跨度", f"{start} ~ {end}" if start else "—")
+
+    if not filtered:
+        st.warning("所选时间范围内没有记录。")
+        return
+
+    st.dataframe(
+        pd.DataFrame([
+            {
+                "上传时间": r.get("uploaded_at", ""),
+                "文件名称": r.get("name", ""),
+                "大小(MB)": round(int(r.get("size") or 0) / 1024 / 1024, 2),
+                "上传状态": history.record_status(SUBJECT, r),
+                "公司": r.get("company", ""),
+            }
+            for r in filtered
+        ]),
+        width="stretch", hide_index=True,
+    )
+
+    st.markdown("#### 逐条操作")
+    for r in filtered:
+        rid = r["id"]
+        status = history.record_status(SUBJECT, r)
+        with st.container(border=True):
+            c1, c2, c3 = st.columns([5, 1, 1], vertical_alignment="center")
+            c1.markdown(
+                f"**{r.get('name', '未命名.pdf')}**\n\n"
+                f"{r.get('uploaded_at', '')} · {int(r.get('size') or 0) / 1024 / 1024:.2f} MB · {status}"
+            )
+            if c2.button("打开", key=f"page_open_{rid}", width="stretch",
+                         disabled=status != history.STATUS_OK):
+                st.session_state["history_active"] = rid
+                st.session_state["nav_view"] = "财报分析"
+                st.rerun()
+            if c3.button("删除", key=f"page_del_{rid}", width="stretch"):
+                confirm_delete(rid, r.get("name", ""))
+
+    if st.button("清空我的全部记录", key="page_clear"):
+        confirm_clear("")
+
+
 def sidebar_history(uploaded=None) -> None:
-    """侧边栏上传历史：最近 6 条直接可见，超出滚动，最多保留 12 条。"""
-    records = history.list_records()
-    st.sidebar.markdown('<div class="cb-side-title">上传历史</div>',
-                        unsafe_allow_html=True)
-    st.sidebar.caption("点击记录切换分析 · 最多保留 12 份")
+    """侧边栏上传历史（紧凑布局）：标题与清空按钮同行，列表滚动查看。"""
+    records = history.list_records(SUBJECT)
+    sig = f"{uploaded.name}|{uploaded.size}" if uploaded is not None else ""
+    title_col, action_col = st.sidebar.columns([2.4, 1], gap="small",
+                                               vertical_alignment="center")
+    title_col.markdown('<div class="cb-side-title">上传历史</div>',
+                       unsafe_allow_html=True)
+    if records and action_col.button("清空", key="hist_clear", width="stretch",
+                                     help="清空所有上传记录"):
+        confirm_clear(sig)
     if not records:
         st.sidebar.markdown(
             '<div class="cb-hist-empty"><b>暂无上传记录</b>'
-            "<span>上传的财报会自动保存在这里，方便随时回看。</span></div>",
+            "<span>上传的财报会自动保存在这里。</span></div>",
             unsafe_allow_html=True,
         )
         return
 
-    sig = f"{uploaded.name}|{uploaded.size}" if uploaded is not None else ""
-    if st.sidebar.button("清空所有记录", key="hist_clear", width="stretch"):
-        confirm_clear(sig)
-
-    box = st.sidebar.container(height=440, border=False)
+    st.sidebar.caption("点击切换 · 最多 12 份")
     active = st.session_state.get("history_active")
-    with box:
+    with st.sidebar.container(height=200, border=False):
         for record in records:
             rid = record["id"]
             with st.container(border=True):
-                c1, c2 = st.columns([4.5, 1], vertical_alignment="center")
+                c1, c2 = st.columns([4.6, 1], gap="small", vertical_alignment="center")
                 label = record.get("name") or "未命名.pdf"
                 if len(label) > 24:
                     label = label[:22] + "…"
                 if c1.button(label, key=f"hist_open_{rid}", width="stretch",
                              help="点击打开该文档的分析结果"):
                     st.session_state["history_active"] = rid
+                    st.session_state["nav_view"] = "财报分析"
                     st.rerun()
                 if c2.button("删除", key=f"hist_del_{rid}", width="stretch"):
                     confirm_delete(rid, record.get("name") or "")
@@ -244,9 +484,20 @@ def sidebar_history(uploaded=None) -> None:
 
 # ---------------- 侧边栏 ----------------
 ui.sidebar_brand()
+sidebar_identity()
+_view = st.sidebar.radio(
+    "导航", ["财报分析", "我的历史记录"], horizontal=True,
+    key="nav_view", label_visibility="collapsed",
+)
 
-uploaded = st.sidebar.file_uploader("上传年报 PDF", type=["pdf"])
-sidebar_history(uploaded)
+uploaded = None
+if _view == "财报分析":
+    uploaded = st.sidebar.file_uploader("上传年报 PDF", type=["pdf"])
+    sidebar_history(uploaded)
+
+if _view == "我的历史记录":
+    history_page()
+    st.stop()
 
 # 新上传的文件优先；点击历史记录时切换为历史文档，直到再次上传新文件
 if uploaded is not None:
@@ -259,8 +510,8 @@ if uploaded is not None:
 source = None
 active = st.session_state.get("history_active")
 if active:
-    _record = history.get_record(active)
-    _blob = history.load_bytes(active) if _record else None
+    _record = history.get_record(SUBJECT, active)
+    _blob = history.load_bytes(SUBJECT, active) if _record else None
     if _record and _blob is not None:
         source = _HistoryFile(_record, _blob)
     else:
@@ -315,7 +566,7 @@ except (ParseError, RuntimeError) as e:
 # 解析成功后写入上传历史（同内容文件自动去重，不改变首次上传时间）；
 # 刚执行「清空所有记录」时，当前打开的文件不再写回，直到用户更换文件。
 if st.session_state.get("_history_no_save_sig") != f"{source.name}|{source.size}":
-    history.add_record(source.name, source.getvalue(), data.get("meta") or {})
+    history.add_record(SUBJECT, source.name, source.getvalue(), data.get("meta") or {})
 
 index = build_index(data)
 
@@ -406,7 +657,6 @@ with tab1:
         ]
         if df is not None
     ]
-    table_export_panel("sheet", "报表预览", sheet_tables, meta)
     for label, df in [
         ("资产负债表", data.get("balance_sheet")),
         ("利润表", data.get("income")),
@@ -417,6 +667,7 @@ with tab1:
             st.write("未解析到该报表。")
         else:
             st.dataframe(df, width="stretch", hide_index=True)
+    table_export_panel("sheet", "报表预览", sheet_tables, meta)
 
 with tab2:
     ratios = memo(_ratio_key, lambda: compute_ratios(data, caliber=caliber_map, extra=extra)).copy()
@@ -441,8 +692,6 @@ with tab2:
             "name": cat,
             "frame": sub[["指标", "重要性", "数值", "单位", "口径", "溯源", "备注"]],
         })
-    table_export_panel("ratio", "财务比率", ratio_blocks, meta)
-
     for block in ratio_blocks:
         st.subheader(block["name"])
         st.dataframe(
@@ -455,11 +704,11 @@ with tab2:
                 "溯源": st.column_config.TextColumn(width="small"),
             },
         )
+    table_export_panel("ratio", "财务比率", ratio_blocks, meta)
 
 with tab3:
     dpt = dupont_analysis(data)
     st.caption("ROE = 销售净利率 × 总资产周转率 × 权益乘数（本期按平均数口径；上期以期末数近似）")
-    table_export_panel("dupont", "杜邦分析", [{"name": "杜邦三因素分解", "frame": dpt}], meta)
     st.dataframe(
         dpt, width="stretch", hide_index=True,
         column_config={
@@ -481,6 +730,7 @@ with tab3:
             "驱动类型判断：销售净利率反映盈利能力，总资产周转率反映营运能力，"
             "权益乘数反映财务杠杆；需结合同行业对比判断 ROE 的可持续性。"
         )
+    table_export_panel("dupont", "杜邦分析", [{"name": "杜邦三因素分解", "frame": dpt}], meta)
 
 with tab4:
     st.caption("每个数字可追溯到 PDF 页码与原文；置信度低于 0.70 标记「需人工确认」，未定位不猜值。")
@@ -597,6 +847,29 @@ with tab6:
     s2.metric("F 分数", f"{f['score']} / {f.get('denominator', 9)}")
     s3.metric("五维总分", f"{total:.0f} / 100")
     s4.metric("综合评级", grade(total))
+
+    help_key = st.session_state.get("risk_help")
+    h1, h2, h3, h4 = st.columns(4)
+    for col, key, label in (
+        (h1, "z", "评分说明 · Altman Z"),
+        (h2, "f", "评分说明 · F 分数"),
+        (h3, "dim", "评分说明 · 五维总分"),
+        (h4, "grade", "评分说明 · 综合评级"),
+    ):
+        active = help_key == key
+        if col.button(label, key=f"risk_help_{key}", width="stretch",
+                      type="primary" if active else "secondary"):
+            st.session_state["risk_help"] = None if active else key
+
+    help_key = st.session_state.get("risk_help")
+    if help_key:
+        with st.container(border=True):
+            head, close = st.columns([7, 1], vertical_alignment="center")
+            head.markdown(f"**{RISK_HELP[help_key]['title']}**")
+            if close.button("关闭", key="risk_help_close", width="stretch"):
+                st.session_state["risk_help"] = None
+                st.rerun()
+            st.markdown(RISK_HELP[help_key]["body"])
 
     st.plotly_chart(radar_chart(dim_scores), width="stretch")
     with st.expander(f"Altman Z 分项（{alt['model']}）"):

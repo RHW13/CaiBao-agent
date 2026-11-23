@@ -11,7 +11,7 @@ END_MARKERS = {
     "balance_sheet": ["负债和所有者权益总计", "负债及所有者权益总计", "负债和股东权益总计",
                       "负债及股东权益总计", "母公司资产负债表",
                       "股东权益变动表", "所有者权益变动表"],
-    "income": ["稀释每股收益", "母公司利润表", "股东权益变动表", "所有者权益变动表"],
+    "income": ["稀释每股收益", "股东权益变动表", "所有者权益变动表"],
     "cashflow": ["期末现金及现金等价物余额", "年末现金及现金等价物余额", "母公司现金流量表",
                  "股东权益变动表", "所有者权益变动表"],
 }
@@ -389,6 +389,19 @@ def _is_footer_row(row: list, zone: float) -> bool:
     return abs(value) < 10000 and float(value).is_integer()
 
 
+_PARENT_ONLY_TITLES = ("母公司利润表", "公司利润表", "本行利润表", "本行损益表",
+                       "公司损益表")
+
+
+def _is_parent_title(word: str) -> bool:
+    """标题词是否为纯母公司报表（排除「合并及公司利润表」这类合并标题）。"""
+    text = (word or "").strip()
+    for prefix in ("未经审计", "经审计", "（未经审计）", "(未经审计)"):
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+    return text in _PARENT_ONLY_TITLES
+
+
 def _parse_statement(pages: list, start_page: int, end_markers: list, stop_page: int = None,
                      stop_titles=None):
     """从起始页起重建单张报表，返回 (rows_data, unknown_accounts, blank_accounts)。
@@ -520,6 +533,12 @@ def _parse_statement(pages: list, start_page: int, end_markers: list, stop_page:
                     continue
                 if not started:
                     continue
+                if pg["page"] != start_page and any(
+                        _is_parent_title(w["text"]) for w in text_words):
+                    # 续页出现本行/公司利润表标题：合并表结束，后续为母公司表
+                    flush()
+                    stopped = True
+                    break
                 if stop_titles is not None and pg["page"] != start_page and stop_titles.match(text):
                     flush()
                     stopped = True
@@ -654,6 +673,25 @@ def _clean_company(name: str, glossary: bool = False) -> str:
     return name.strip(" ）)")
 
 
+def _check_identity(df, warnings: list) -> None:
+    """勾稽校验：资产总计 ≈ 负债合计 + 所有者权益合计（容差 0.5%）。"""
+    def value(name):
+        hit = df[df["科目"] == name]
+        if hit.empty:
+            return None
+        raw = hit.iloc[0]["本期期末"]
+        return None if pd.isna(raw) else float(raw)
+
+    assets, liab, equity = value("资产总计"), value("负债合计"), value("所有者权益合计")
+    if assets is None or liab is None or equity is None or assets == 0:
+        return
+    diff = abs(assets - (liab + equity))
+    if diff > max(1.0, abs(assets) * 0.005):
+        warnings.append(
+            f"资产负债表勾稽差异：资产总计与「负债合计+所有者权益合计」相差 {diff:,.0f}，请核对原表。"
+        )
+
+
 def load_pdf(path: str) -> dict:
     """解析年报 PDF，返回三表 DataFrame 与元信息。
 
@@ -677,6 +715,14 @@ def load_pdf(path: str) -> dict:
     }
 
     labels = {"balance_sheet": "资产负债表", "income": "利润表", "cashflow": "现金流量表"}
+    # 结构校验：识别到的页面必须包含该表的关键科目，否则视为误命中的附注或分析页
+    key_rows = {
+        "balance_sheet": ("资产总计", "负债合计", "所有者权益合计"),
+        "income": ("营业收入", "营业利润", "利润总额", "净利润"),
+        "cashflow": ("经营活动产生的现金流量净额", "经营活动现金流入",
+                     "销售商品、提供劳务收到的现金"),
+    }
+    max_rows = {"balance_sheet": 150, "income": 120, "cashflow": 120}
     starts_order = sorted(p for p in starts.values() if p)
 
     def stop_for(start: int) -> int:
@@ -694,7 +740,17 @@ def load_pdf(path: str) -> dict:
             pages, start, END_MARKERS[stmt], stop_page=stop_for(start),
             stop_titles=_STOP_TITLES[stmt],
         )
+        names = {normalize_account(r["name"]) for r in rows_data}
+        if (len(rows_data) < 3 or len(rows_data) > max_rows[stmt]
+                or not names & set(key_rows[stmt])):
+            result["warnings"].append(
+                f"第 {start} 页疑似附注或非报表页：未识别到「{labels[stmt]}」的关键科目，已忽略该页内容。"
+            )
+            result["stmt_starts"][stmt] = None
+            continue
         result[stmt] = _to_dataframe(rows_data, stmt)
+        if stmt == "balance_sheet":
+            _check_identity(result[stmt], result["warnings"])
         result["unknown_accounts"].extend(unknown)
         result["blank_accounts"][stmt] = sorted(blanks)
         for r in rows_data:
@@ -703,5 +759,22 @@ def load_pdf(path: str) -> dict:
             trace["stmt"] = stmt
             trace["values"] = [r["本期"], r["上期"]]
             result["traces"][stmt].append(trace)
+
+    if any(result[s] is None for s in labels):
+        # 港股/IFRS 报表用繁体标题与「收入/年度盈利」等科目，不在当前 A 股口径内
+        hk_titles = ("綜合財務狀況表", "綜合收益表", "綜合現金流量表")
+        if all(result[s] is None for s in labels) and any(
+            any(k in p["text"] for k in hk_titles) for p in pages
+        ):
+            result["warnings"].append(
+                "检测到港股/IFRS 格式财务报表（繁体「綜合收益表 / 綜合財務狀況表」），"
+                "当前版本按 A 股企业会计准则解析，暂不支持该格式。"
+            )
+        blank = sum(1 for p in pages if not p["words"])
+        if blank >= 3:
+            result["warnings"].append(
+                f"检测到 {blank} 页无文字层（疑似扫描图片）；若财务报表位于其中，"
+                "当前无法提取，请提供电子版（有文字层）报表。"
+            )
 
     return result

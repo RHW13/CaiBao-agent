@@ -119,23 +119,33 @@ section[data-testid="stSidebar"] .block-container{ padding-top:1.4rem; }
 .cb-brand-text{ font-size:15px; font-weight:700; color:var(--navy); letter-spacing:.03em; }
 .cb-brand-sub{ font-size:11.5px; color:var(--muted); margin:2px 0 14px 40px; }
 
-/* ---------- 侧边栏上传历史 ---------- */
+/* ---------- 侧边栏上传历史（紧凑版） ---------- */
 .cb-side-title{
-  font-size:11px; font-weight:700; letter-spacing:.16em; color:var(--navy-2);
-  text-transform:uppercase; margin:16px 0 2px;
+  font-size:10.5px; font-weight:700; letter-spacing:.14em; color:var(--navy-2);
+  text-transform:uppercase; margin:2px 0 0;
 }
 section[data-testid="stSidebar"] .stButton > button{
-  font-size:12.5px; min-height:34px; padding:4px 8px;
+  font-size:12px; min-height:30px; padding:2px 6px;
 }
+section[data-testid="stSidebar"] [data-testid="stCaptionContainer"]{ margin:0; }
 section[data-testid="stSidebar"] div[data-testid="stVerticalBlockBorderWrapper"]{
-  border-radius:10px !important; background:#FFFFFF;
+  border-radius:9px !important; background:#FFFFFF;
+}
+section[data-testid="stSidebar"] div[data-testid="stVerticalBlockBorderWrapper"] > div{
+  padding:.25rem .4rem !important;
+}
+section[data-testid="stSidebar"] div[data-testid="stVerticalBlockBorderWrapper"] div[data-testid="stVerticalBlock"]{
+  gap:.08rem !important;
+}
+section[data-testid="stSidebar"] div[data-testid="stVerticalBlockBorderWrapper"] [data-testid="stCaptionContainer"] p{
+  font-size:10.5px; line-height:1.3;
 }
 .cb-hist-empty{
-  border:1px dashed var(--line); border-radius:12px; background:#FDFEFF;
-  padding:18px 14px; text-align:center; margin-top:2px;
+  border:1px dashed var(--line); border-radius:10px; background:#FDFEFF;
+  padding:9px 8px; text-align:center; margin-top:2px;
 }
-.cb-hist-empty b{ display:block; font-size:13px; color:var(--navy); margin-bottom:4px; }
-.cb-hist-empty span{ font-size:12px; color:var(--muted); line-height:1.6; }
+.cb-hist-empty b{ display:block; font-size:12px; color:var(--navy); margin-bottom:3px; }
+.cb-hist-empty span{ font-size:11px; color:var(--muted); line-height:1.5; }
 @media (max-width:640px){
   section[data-testid="stSidebar"] .block-container{
     padding-left:.7rem !important; padding-right:.7rem !important;
@@ -176,14 +186,18 @@ hr{ border-color:var(--line); }
 /* ---------- 财报问答悬浮组件 ----------
    组件内部的 main.js 会把 iframe 自身调成悬浮框（同源，可精确控制大小）；
    这里保留一份 CSS 兜底，避免脚本被拦时组件铺满屏幕。 */
-iframe[title*="qa_widget"],
-[data-testid="stCustomComponentV1"] iframe{
+iframe[title*="qa_widget"]{
   position:fixed !important; right:12px !important; top:50% !important;
   left:auto !important; bottom:auto !important;
   width:100px !important; height:126px !important;
   transform:translateY(-50%);
   border:0 !important; background:transparent !important;
   z-index:9000 !important;
+}
+/* 身份识别组件只做后台读写，不占任何可见空间 */
+iframe[title*="identity_widget"]{
+  width:0 !important; height:0 !important; border:0 !important;
+  visibility:hidden !important; pointer-events:none !important;
 }
 [data-testid="stCustomComponentV1"], .stCustomComponentV1{
   height:0 !important; min-height:0 !important; margin:0 !important; padding:0 !important;

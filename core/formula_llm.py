@@ -1,6 +1,5 @@
 """自然语言 -> 公式 AST JSON（DeepSeek 优先，规则模板兜底）。"""
 import json
-import re
 
 from . import config
 from .evaluator import parse_formula, validate_ast, FormulaError

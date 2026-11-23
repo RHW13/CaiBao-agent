@@ -19,6 +19,7 @@ import pandas as pd
 
 from .calibers import CALIBERS, get_caliber
 from .evaluator import parse_formula, evaluate, FormulaError, iter_vars
+from .bank import is_bank, bank_rows
 
 _DAYS = 360.0
 
@@ -275,6 +276,8 @@ def compute_ratios(statements: dict, caliber="标准", extra: dict = None) -> pd
             "口径": cal_label,
             "备注": note,
         })
+    if is_bank(statements):
+        rows.extend(bank_rows(statements, data))
     return pd.DataFrame(rows)
 
 

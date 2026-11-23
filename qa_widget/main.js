@@ -15,6 +15,8 @@
   var state = { messages: [], ready: false, company: "", pending: false, open: false };
   var box = { left: 0, top: 0, w: CLOSED_W, h: CLOSED_H };
   var startDrag = null;
+  var mascotDrag = null;
+  var skipMascotClick = false;
 
   /* ---------------- 与 Streamlit 通信 ---------------- */
   function post(type, payload) {
@@ -60,6 +62,8 @@
     s.setProperty("z-index", "9000", "important");
     s.setProperty("pointer-events", "auto", "important");
     s.setProperty("box-shadow", "none", "important");
+    // 清除主题兜底样式里的 translateY(-50%)，否则按 left/top 定位会整体偏移半个高度
+    s.setProperty("transform", "none", "important");
     var holder = fe.parentElement;
     if (holder) {
       holder.style.height = "0px";
@@ -82,26 +86,29 @@
     };
   }
 
-  function readPos() {
+  function readStore(key) {
     try {
-      var raw = sessionStorage.getItem("qa_pos");
+      var raw = sessionStorage.getItem(key);
       return raw ? JSON.parse(raw) : null;
     } catch (e) { return null; }
   }
 
   function layout() {
+    if (mascotDrag || startDrag) return;   // 拖拽中不被重渲染打断
     var v = viewport();
     if (state.open) {
       var w = Math.min(380, v.w - 24);
       var h = Math.min(560, Math.round(v.h * 0.82));
-      var pos = readPos() || { left: v.w - w - 16, top: v.h - h - 20 };
+      var pos = readStore("qa_pos") || { left: v.w - w - 16, top: v.h - h - 20 };
       var p = clampRect(pos.left, pos.top, w, h);
       box = { left: p.left, top: p.top, w: w, h: h };
-      applyFrame(box.left, box.top, box.w, box.h);
     } else {
-      box = { left: v.w - CLOSED_W - 12, top: Math.round((v.h - CLOSED_H) / 2), w: CLOSED_W, h: CLOSED_H };
-      applyFrame(box.left, box.top, box.w, box.h);
+      var mp = readStore("qa_mascot_pos")
+        || { left: v.w - CLOSED_W - 12, top: Math.round((v.h - CLOSED_H) / 2) };
+      var m = clampRect(mp.left, mp.top, CLOSED_W, CLOSED_H);
+      box = { left: m.left, top: m.top, w: CLOSED_W, h: CLOSED_H };
     }
+    applyFrame(box.left, box.top, box.w, box.h);
   }
   layout();
 
@@ -188,7 +195,46 @@
     layout();
   }
 
-  mascot.addEventListener("click", function () { openPanel(true); });
+  /* ---------------- 猫头鹰图标：点击打开，拖动挪位 ---------------- */
+  mascot.addEventListener("pointerdown", function (e) {
+    if (e.pointerType === "mouse" && e.button !== 0) return;
+    mascotDrag = { sx: e.screenX, sy: e.screenY, left: box.left, top: box.top, moved: false };
+    skipMascotClick = false;
+    try { mascot.setPointerCapture(e.pointerId); } catch (err) { /* noop */ }
+  });
+
+  mascot.addEventListener("pointermove", function (e) {
+    if (!mascotDrag) return;
+    var dx = e.screenX - mascotDrag.sx;
+    var dy = e.screenY - mascotDrag.sy;
+    if (!mascotDrag.moved && Math.abs(dx) + Math.abs(dy) < 4) return;  // 抖动阈值内仍视为点击
+    mascotDrag.moved = true;
+    skipMascotClick = true;
+    mascot.classList.add("dragging");
+    var p = clampRect(mascotDrag.left + dx, mascotDrag.top + dy, box.w, box.h);
+    box.left = p.left;
+    box.top = p.top;
+    applyFrame(p.left, p.top, box.w, box.h);
+    e.preventDefault();
+  });
+
+  function endMascotDrag(e) {
+    if (!mascotDrag) return;
+    var moved = mascotDrag.moved;
+    mascotDrag = null;
+    mascot.classList.remove("dragging");
+    try { mascot.releasePointerCapture(e.pointerId); } catch (err) { /* noop */ }
+    if (moved) {
+      sessionStorage.setItem("qa_mascot_pos", JSON.stringify({ left: box.left, top: box.top }));
+    }
+  }
+  mascot.addEventListener("pointerup", endMascotDrag);
+  mascot.addEventListener("pointercancel", endMascotDrag);
+
+  mascot.addEventListener("click", function () {
+    if (skipMascotClick) { skipMascotClick = false; return; }   // 拖动结束抑制误触打开
+    openPanel(true);
+  });
   document.getElementById("btn-close").addEventListener("click", closePanel);
   document.getElementById("btn-min").addEventListener("click", closePanel);
   document.addEventListener("keydown", function (e) {
