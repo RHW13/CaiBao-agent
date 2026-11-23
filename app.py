@@ -39,8 +39,8 @@ st.set_page_config(
 ui.apply_theme()
 st.session_state.setdefault("chat", [])
 
-# ---------------- 身份识别：账号登录态 + 设备唯一标识 ----------------
-# 身份识别与旧数据迁移属于增强能力：任一步失败都退回「访客设备」主体，
+# ---------------- 身份识别：账号登录态（历史记录仅对登录用户开放） ----------------
+# 身份识别与旧数据迁移属于增强能力：任一步失败都退回匿名访问，
 # 不让启动期异常阻断整个页面（也兼容热更新后旧模块仍驻留 sys.modules 的情况）。
 _ident, _device_id, _token, _auth_user = {}, "", "", None
 try:
@@ -51,7 +51,7 @@ try:
     _device_id = str(_ident.get("device_id") or "").strip()
     _token = str(_ident.get("token") or "").strip()
     _auth_user = identity.user_from_token(_token)
-except Exception:                    # 组件不可用：按设备主体继续运行
+except Exception:                    # 组件不可用：按匿名访问继续运行
     st.session_state["_identity_degraded"] = True
 
 if _auth_user:
@@ -61,12 +61,13 @@ else:
     st.session_state.pop("auth_user", None)
     st.session_state.pop("auth_token", None)
 
-# 主体在服务端由身份计算，前端不可指定，保证越权访问无从下手
-SUBJECT = identity.subject(_auth_user, _device_id)
-SUBJECT_LABEL = identity.subject_label(_auth_user, _device_id)
+# 未登录（匿名）可完整使用分析功能，但不产生、也不展示任何历史记录
+LOGGED_IN = bool(_auth_user)
+SUBJECT = identity.subject(_auth_user) if LOGGED_IN else None
+SUBJECT_LABEL = identity.subject_label(_auth_user) if LOGGED_IN else "未登录"
 
 _migrate = getattr(history, "migrate_legacy", None)
-if _device_id and callable(_migrate):
+if LOGGED_IN and callable(_migrate):
     try:
         _migrate(SUBJECT)
     except Exception:                # 迁移失败不影响正常使用
@@ -348,17 +349,32 @@ def sidebar_identity() -> None:
     """侧边栏身份区：未登录可注册 / 登录，已登录可退出。"""
     user = st.session_state.get("auth_user")
     with st.sidebar.expander("账号已登录" if user else "身份与登录", expanded=not user):
-        st.caption(f"当前主体：{SUBJECT_LABEL}")
-        if st.session_state.get("_identity_degraded"):
-            st.caption("身份组件暂不可用，已按设备身份继续运行。")
         if user:
-            st.caption("历史记录已绑定到账号，退出后回到本设备身份。")
+            st.caption(f"当前主体：{SUBJECT_LABEL}")
+            st.caption("上传历史已绑定到该账号，换设备登录同样可见。")
             if st.button("退出登录", key="logout_btn", width="stretch"):
                 identity.logout(st.session_state.get("auth_token"))
                 st.session_state["_clear_token"] = True
-                st.session_state.pop("auth_user", None)
-                st.session_state.pop("auth_token", None)
-                st.session_state.pop("history_active", None)
+                for k in ("auth_user", "auth_token", "history_active", "nav_view",
+                          "draft", "draft_key", "_table_pdf", "_history_no_save_sig",
+                          "_reg_done", "_memo", "uploader", "_upload_sig"):
+                    st.session_state.pop(k, None)
+                st.rerun()
+            return
+
+        st.caption("无需登录即可使用全部财报分析功能。")
+        if st.session_state.get("_identity_degraded"):
+            st.caption("身份组件暂不可用，已按匿名方式继续运行。")
+
+        _reg_done = st.session_state.get("_reg_done")
+        if _reg_done:
+            st.success(f"账号「{_reg_done}」注册成功。")
+            st.caption("请使用该账号登录，登录后历史记录将绑定到账号。")
+            if st.button("前往登录", key="reg_to_login", type="primary", width="stretch"):
+                st.session_state.pop("_reg_done", None)
+                for k in ("reg_user", "reg_pwd", "reg_pwd2"):
+                    st.session_state.pop(k, None)
+                st.session_state["login_user"] = _reg_done
                 st.rerun()
             return
 
@@ -371,7 +387,8 @@ def sidebar_identity() -> None:
                 if ok:
                     st.session_state["_issue_token"] = res
                     st.rerun()
-                st.error(res) if not ok else None
+                else:
+                    st.error(res)
         with tab_reg, st.form("register_form"):
             ru = st.text_input("用户名", key="reg_user", help="字母、数字、下划线、点、短横线、@ 或中文")
             rp = st.text_input("密码（至少 6 位）", type="password", key="reg_pwd")
@@ -381,19 +398,23 @@ def sidebar_identity() -> None:
                     st.error("两次输入的密码不一致。")
                 else:
                     ok, res = identity.register(ru, rp)
-                    st.success(res) if ok else st.error(res)
-        st.caption("未登录时按设备标识隔离；登录后历史归属到账号，换设备登录同样可见。")
+                    if ok:                       # 成功后切换到结果页，避免停留在表单
+                        st.session_state["_reg_done"] = identity.norm_username(ru)
+                        st.rerun()
+                    else:
+                        st.error(res)
 
 
 def history_page() -> None:
     """当前身份主体的专属历史记录页：列表、时间筛选、逐条删除。"""
-    role = "账号" if st.session_state.get("auth_user") else "设备"
+    if not LOGGED_IN:
+        return
     st.markdown("## 我的历史记录")
     if not HISTORY_OK:
         st.warning("历史记录模块版本不匹配，请重启应用（Reboot app）后再试。")
         return
-    st.caption(f"当前身份：{SUBJECT_LABEL}（按{role}维度隔离）。"
-               "此处仅列出并允许操作该身份上传的财报，其他用户/设备的数据不可见。")
+    st.caption(f"当前身份：{SUBJECT_LABEL}（按账号隔离）。"
+               "此处仅列出并允许操作该账号上传的财报，其他账号的数据不可见。")
 
     records = history.list_records(SUBJECT, limit=1000)
     if not records:
@@ -468,6 +489,8 @@ def history_page() -> None:
 
 def sidebar_history(uploaded=None) -> None:
     """侧边栏上传历史（紧凑布局）：标题与清空按钮同行，列表滚动查看。"""
+    if not LOGGED_IN:
+        return
     if not HISTORY_OK:
         st.sidebar.caption("历史记录模块版本不匹配，重启应用后可用。")
         return
@@ -513,17 +536,24 @@ def sidebar_history(uploaded=None) -> None:
 # ---------------- 侧边栏 ----------------
 ui.sidebar_brand()
 sidebar_identity()
-_view = st.sidebar.radio(
-    "导航", ["财报分析", "我的历史记录"], horizontal=True,
-    key="nav_view", label_visibility="collapsed",
-)
+
+# 历史记录入口仅登录后出现；未登录只保留分析功能
+if LOGGED_IN:
+    _view = st.sidebar.radio(
+        "导航", ["财报分析", "我的历史记录"], horizontal=True,
+        key="nav_view", label_visibility="collapsed",
+    )
+else:
+    _view = "财报分析"
+    st.session_state.pop("nav_view", None)
 
 uploaded = None
 if _view == "财报分析":
-    uploaded = st.sidebar.file_uploader("上传年报 PDF", type=["pdf"])
-    sidebar_history(uploaded)
+    uploaded = st.sidebar.file_uploader("上传年报 PDF", type=["pdf"], key="uploader")
+    if LOGGED_IN:
+        sidebar_history(uploaded)
 
-if _view == "我的历史记录":
+if LOGGED_IN and _view == "我的历史记录":
     history_page()
     st.stop()
 
@@ -537,7 +567,7 @@ if uploaded is not None:
 
 source = None
 active = st.session_state.get("history_active")
-if HISTORY_OK and active:
+if LOGGED_IN and HISTORY_OK and active:
     _record = history.get_record(SUBJECT, active)
     _blob = history.load_bytes(SUBJECT, active) if _record else None
     if _record and _blob is not None:
@@ -593,7 +623,7 @@ except (ParseError, RuntimeError) as e:
 
 # 解析成功后写入上传历史（同内容文件自动去重，不改变首次上传时间）；
 # 刚执行「清空所有记录」时，当前打开的文件不再写回，直到用户更换文件。
-if HISTORY_OK and st.session_state.get("_history_no_save_sig") != f"{source.name}|{source.size}":
+if LOGGED_IN and HISTORY_OK and st.session_state.get("_history_no_save_sig") != f"{source.name}|{source.size}":
     history.add_record(SUBJECT, source.name, source.getvalue(), data.get("meta") or {})
 
 index = build_index(data)
